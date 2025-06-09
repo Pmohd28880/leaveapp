@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Apply for Leave - Leave Management</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f5f5f5;
+      }
+      .container {
+        background: white;
+        padding: 30px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 30px;
+        padding-bottom: 20px;
+        border-bottom: 2px solid #eee;
+      }
+      .user-info {
+        color: #666;
+        font-size: 14px;
+      }
+      .nav-links a {
+        margin-left: 15px;
+        padding: 8px 16px;
+        text-decoration: none;
+        background: #6c757d;
+        color: white;
+        border-radius: 4px;
+        transition: background-color 0.3s;
+      }
+      .nav-links a:hover {
+        background: #5a6268;
+      }
+      .nav-links a.logout {
+        background: #dc3545;
+      }
+      .nav-links a.logout:hover {
+        background: #c82333;
+      }
+      .alert {
+        padding: 12px;
+        margin: 15px 0;
+        border-radius: 4px;
+        border-left: 4px solid;
+      }
+      .alert-success {
+        background-color: #d4edda;
+        border-color: #28a745;
+        color: #155724;
+      }
+      .alert-warning {
+        background-color: #fff3cd;
+        border-color: #ffc107;
+        color: #856404;
+      }
+      .alert-error {
+        background-color: #f8d7da;
+        border-color: #dc3545;
+        color: #721c24;
+      }
+      .form-group {
+        margin-bottom: 20px;
+      }
+      .form-group label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: bold;
+        color: #333;
+      }
+      .form-group input,
+      .form-group select {
+        width: 100%;
+        padding: 12px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 16px;
+        box-sizing: border-box;
+      }
+      .form-group input:focus,
+      .form-group select:focus {
+        outline: none;
+        border-color: #007bff;
+        box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+      }
+      .btn {
+        background: #007bff;
+        color: white;
+        padding: 12px 24px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        transition: background-color 0.3s;
+        width: 100%;
+      }
+      .btn:hover {
+        background: #0056b3;
+      }
+      .help-text {
+        font-size: 12px;
+        color: #666;
+        margin-top: 4px;
+      }
+      .form-row {
+        display: flex;
+        gap: 15px;
+      }
+      .form-row .form-group {
+        flex: 1;
+      }
+      .info-box {
+        background: #e9ecef;
+        padding: 15px;
+        border-radius: 4px;
+        margin-bottom: 20px;
+      }
+      .info-box h4 {
+        margin: 0 0 10px 0;
+        color: #495057;
+      }
+      .info-box ul {
+        margin: 0;
+        padding-left: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div>
+          <h1>Apply for Leave</h1>
+          <div class="user-info">
+            Logged in as: <strong>{{ current_user.username }}</strong>
+            {% if current_user.user_team %}
+            <br />Team: {{ current_user.user_team.name }} {% endif %}
+          </div>
+        </div>
+        <div class="nav-links">
+          <a href="/dashboard">Back to Dashboard</a>
+          <a href="/logout" class="logout">Logout</a>
+        </div>
+      </div>
+
+      <!-- Flash Messages -->
+      {% with messages = get_flashed_messages(with_categories=true) %} {% if
+      messages %} {% for category, message in messages %}
+      <div class="alert alert-{{ category }}">{{ message }}</div>
+      {% endfor %} {% endif %} {% endwith %}
+
+      <!-- Info Box -->
+      <div class="info-box">
+        <h4>📋 Leave Policy Guidelines</h4>
+        <ul>
+          <li>Sick leave: Up to 5 consecutive days can be auto-approved</li>
+          <li>Vacation leave: Requires advance notice and team coverage</li>
+          <li>
+            All requests are processed by our AI system for fair evaluation
+          </li>
+          <li>Emergency requests will be reviewed on a case-by-case basis</li>
+        </ul>
+      </div>
+
+      <form method="POST" action="/apply">
+        <div class="form-row">
+          <div class="form-group">
+            <label for="start_date">Start Date:</label>
+            <input
+              type="date"
+              id="start_date"
+              name="start_date"
+              required
+              min="{{ moment().strftime('%Y-%m-%d') if moment else '' }}"
+            />
+            <div class="help-text">When does your leave start?</div>
+          </div>
+
+          <div class="form-group">
+            <label for="end_date">End Date:</label>
+            <input type="date" id="end_date" name="end_date" required />
+            <div class="help-text">When does your leave end?</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="reason">Reason for Leave:</label>
+          <select id="reason" name="reason" required>
+            <option value="">Select a reason...</option>
+            <option value="sick">🤒 Sick Leave</option>
+            <option value="vacation">🏖️ Vacation Leave</option>
+            <option value="personal">👤 Personal Leave</option>
+            <option value="family">👨‍👩‍👧‍👦 Family Emergency</option>
+            <option value="medical">🏥 Medical Appointment</option>
+          </select>
+          <div class="help-text">
+            Choose the category that best describes your leave
+          </div>
+        </div>
+
+        <button type="submit" class="btn">🚀 Submit Leave Request</button>
+      </form>
+    </div>
+
+    <script>
+      // Date validation
+      document.addEventListener("DOMContentLoaded", function () {
+        const startDate = document.getElementById("start_date");
+        const endDate = document.getElementById("end_date");
+        const today = new Date().toISOString().split("T")[0];
+
+        // Set minimum date to today
+        startDate.min = today;
+        endDate.min = today;
+
+        startDate.addEventListener("change", function () {
+          endDate.min = this.value;
+          if (endDate.value && endDate.value < this.value) {
+            endDate.value = this.value;
+          }
+          updateDuration();
+        });
+
+        endDate.addEventListener("change", function () {
+          if (this.value < startDate.value) {
+            alert("⚠️ End date cannot be earlier than start date");
+            this.value = startDate.value;
+          }
+          updateDuration();
+        });
+
+        function updateDuration() {
+          if (startDate.value && endDate.value) {
+            const start = new Date(startDate.value);
+            const end = new Date(endDate.value);
+            const days = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+
+            // Add duration display
+            let durationEl = document.getElementById("duration-display");
+            if (!durationEl) {
+              durationEl = document.createElement("div");
+              durationEl.id = "duration-display";
+              durationEl.className = "help-text";
+              durationEl.style.fontWeight = "bold";
+              durationEl.style.color = "#007bff";
+              endDate.parentNode.appendChild(durationEl);
+            }
+            durationEl.textContent = `Duration: ${days} day${
+              days > 1 ? "s" : ""
+            }`;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
