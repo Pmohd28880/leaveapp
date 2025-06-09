@@ -639,25 +639,34 @@ class PlanExecutor:
         successful_ops = sum(1 for r in results.values()
                              if getattr(r, 'success', False))
         total_ops = len(results)
-        confidences = [getattr(r, 'confidence', 0.0)
-                       for r in results.values() if hasattr(r, 'confidence')]
-        avg_confidence = sum(confidences) / \
-            len(confidences) if confidences else 0.5
-        success_rate = successful_ops / total_ops if total_ops > 0 else 0
-        status = 'Approved' if success_rate >= 0.8 else 'Escalate' if success_rate >= 0.5 else 'Denied'
 
-        # Extract detailed explanation from results if available
-        detailed_explanation = None
-        for result in results.values():
-            if hasattr(result, 'data') and isinstance(result.data, dict) and 'detailed_explanation' in result.data:
-                detailed_explanation = result.data['detailed_explanation']
-                break
+    # ADD THIS: Don't synthesize if we should call reasoner instead
+        if successful_ops >= total_ops * 0.5:  # If most operations succeeded
+            # Extract data for reasoner
+            reasoner_data = {}
+            for action, result in results.items():
+                if hasattr(result, 'data'):
+                    reasoner_data[action] = result.data
+
+        # Call the actual reasoner (you need to pass it from the executor)
+        # This requires modifying the executor constructor to accept a reasoner
+            reasoner = TransparentReasoner()  # or get from constructor
+            reasoning_result = await reasoner.reason(goal, reasoner_data, None)
+
+            return {
+                'status': reasoning_result.get('decision', 'Escalate'),
+                'confidence': reasoning_result.get('confidence', 0.5),
+                'success': reasoning_result.get('decision') in ['Approved'],
+                'agent_reasoning': reasoning_result.get('detailed_explanation', 'Reasoning completed'),
+                'results': results,
+                'detailed_explanation': reasoning_result.get('detailed_explanation')
+            }
 
         return {
             'status': status,
-            'confidence': avg_confidence,
-            'success': success_rate >= 0.5,
-            'agent_reasoning': detailed_explanation or f'Processed {total_ops} checks, {successful_ops} successful',
+            'confidence': final_confidence,
+            'success': status in ['Approved'],
+            'agent_reasoning': detailed_explanation,
             'results': results,
             'detailed_explanation': detailed_explanation
         }
@@ -665,7 +674,9 @@ class PlanExecutor:
     def _should_replan(self, group_results: Dict, plan: Plan) -> bool:
         failed_ops = sum(1 for r in group_results.values()
                          if not getattr(r, 'success', True))
-        return failed_ops > len(group_results) / 2
+    # CHANGE THIS LINE - it was too aggressive
+        # Only replan if 80%+ fail, not 50%
+        return failed_ops > len(group_results) * 0.8
 
     async def _replan_and_execute(self, plan: Plan, tools: Dict, memory, partial_results: Dict) -> Dict:
         return {
