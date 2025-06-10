@@ -151,11 +151,11 @@ def get_user_leave_history(user_id: int) -> Dict:
                              ) * 100 if recent_leaves else 0
 
             # Determine pattern classification
-            if total_days > 30:
+            if total_days > 45:  # Changed from 30 to 45
                 pattern = "high_usage"
-            elif sick_count > len(recent_leaves) * 0.7:
+            elif sick_count > len(recent_leaves) * 0.8:  # Changed from 0.7 to 0.8
                 pattern = "frequent_sick_leave"
-            elif avg_days_per_request > 7:
+            elif avg_days_per_request > 10:  # Changed from 7 to 10
                 pattern = "long_duration_requests"
             else:
                 pattern = "normal"
@@ -167,7 +167,7 @@ def get_user_leave_history(user_id: int) -> Dict:
                 'approval_rate': approval_rate,
                 'average_duration': avg_days_per_request,
                 'pattern_classification': pattern,
-                'last_leave_date': recent_leaves[0].end_date.strftime('%Y-%m-%d'),
+                'last_leave_date': recent_leaves[0].end_date.strftime('%Y-%m-%d') if recent_leaves[0].end_date else 'N/A',
                 'recent_reasons': [leave.reason for leave in recent_leaves[:3]]
             }
         else:
@@ -192,7 +192,12 @@ def analyze_team_availability(team_id: int, start_date: str, end_date: str) -> D
         # Get team members
         team = Team.query.get(team_id)
         if not team:
-            return {'error': 'Team not found'}
+            return {
+                'error': 'Team not found',
+                'total_team_members': 1,  # Default to prevent division by zero
+                'available_members': 1,
+                'impact_level': 'low'
+            }
 
         total_members = len(team.members)
 
@@ -448,19 +453,25 @@ triage_agent = Agent(
     - Low team/business impact situations
 
     → Escalation Specialist for:
-    - Extended leave requests (>14 days)
-    - Medical emergencies or serious illness
-    - Family crisis situations
-    - Requests during critical business periods
-    - Employees with concerning leave patterns
-    - Policy exception requests
-    - High business impact scenarios
+	- Extended leave requests (>10 days)  # Changed from >14 days
+	- Medical emergencies or serious illness (>7 days sick leave)  # Added duration condition
+	- Family crisis situations (>5 days)
+	- Requests during critical business periods with high team impact
+	- Employees with concerning leave patterns (>60 days in 6 months)  # More specific
+	- Policy exception requests
+	- High + critical business impact scenarios (both high impact AND critical timing)
 
     Always explain your routing decision briefly.
     """,
     handoffs=[decision_agent, escalation_agent]
 )
 
+
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
 # =====================================================
 # AGENTS SDK INTEGRATION CLASS
 # =====================================================
@@ -995,7 +1006,7 @@ def test_escalation():
     html_output = f"""
     <div style="font-family: Arial, sans-serif; margin: 20px;">
         <h2>🚨 Escalation Testing Results</h2>
-        
+
         <div style="background: #f0f8ff; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
             <h3>📊 Test Summary</h3>
             <ul>
@@ -1023,7 +1034,7 @@ def test_escalation():
                     {result.get('test_result', 'UNKNOWN')}
                 </span>
             </h3>
-            
+
             <div style="display: flex; gap: 20px;">
                 <div style="flex: 1;">
                     <h4>📋 Request Details:</h4>
@@ -1033,7 +1044,7 @@ def test_escalation():
                         <li><strong>Dates:</strong> {result.get('request_details', {}).get('start_date', 'N/A')} to {result.get('request_details', {}).get('end_date', 'N/A')}</li>
                     </ul>
                 </div>
-                
+
                 <div style="flex: 1;">
                     <h4>🤖 AI Decision:</h4>
                     <ul>
@@ -1044,20 +1055,20 @@ def test_escalation():
                     </ul>
                 </div>
             </div>
-            
+
             <div style="margin-top: 10px;">
                 <h4>💭 Decision Reasoning:</h4>
                 <p style="background: #f8f9fa; padding: 10px; border-radius: 3px; font-style: italic;">
                     "{result.get('agent_reasoning', 'No reasoning provided')}"
                 </p>
             </div>
-            
+
             <div style="margin-top: 10px;">
                 <h4>🎯 Expected vs Actual:</h4>
                 <p><strong>Expected:</strong> {result.get('expected_outcome', 'N/A')}</p>
                 <p><strong>Actual Decision Reason:</strong> {result.get('actual_decision', {}).get('reason', 'N/A')}</p>
             </div>
-            
+
             {f'<div style="color: red; margin-top: 10px;"><strong>❌ Error:</strong> {result["error"]}</div>' if 'error' in result else ''}
         </div>
         """
