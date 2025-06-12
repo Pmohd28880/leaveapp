@@ -199,6 +199,7 @@
             <th>Reason</th>
             <th>Status</th>
             <th>Decision Reason</th>
+            <th>Policy</th>
           </tr>
         </thead>
         <tbody>
@@ -221,6 +222,15 @@
               </span>
             </td>
             <td>{{ leave.decision_reason or 'System processed' }}</td>
+            <td>
+              <a
+                href="{{ url_for('static', filename='leave_policy_guide_for_employees.pdf') }}"
+                target="_blank"
+                title="View Leave Policy PDF"
+              >
+                📄 View
+              </a>
+            </td>
           </tr>
           {% endfor %}
         </tbody>

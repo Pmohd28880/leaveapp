@@ -79,7 +79,8 @@
         color: #333;
       }
       .form-group input,
-      .form-group select {
+      .form-group select,
+      .form-group textarea {
         width: 100%;
         padding: 12px;
         border: 1px solid #ddd;
@@ -87,8 +88,14 @@
         font-size: 16px;
         box-sizing: border-box;
       }
+      .form-group textarea {
+        min-height: 100px;
+        resize: vertical;
+        font-family: Arial, sans-serif;
+      }
       .form-group input:focus,
-      .form-group select:focus {
+      .form-group select:focus,
+      .form-group textarea:focus {
         outline: none;
         border-color: #007bff;
         box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
@@ -133,6 +140,33 @@
         margin: 0;
         padding-left: 20px;
       }
+      .reason-suggestions {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #007bff;
+      }
+      .reason-tag {
+        display: inline-block;
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        padding: 4px 8px;
+        margin: 2px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 11px;
+        transition: all 0.2s;
+      }
+      .reason-tag:hover {
+        background: #007bff;
+        color: white;
+        border-color: #007bff;
+      }
+      .char-counter {
+        text-align: right;
+        font-size: 11px;
+        color: #666;
+        margin-top: 4px;
+      }
     </style>
   </head>
   <body>
@@ -141,9 +175,7 @@
         <div>
           <h1>Apply for Leave</h1>
           <div class="user-info">
-            Logged in as: <strong>{{ current_user.username }}</strong>
-            {% if current_user.user_team %}
-            <br />Team: {{ current_user.user_team.name }} {% endif %}
+            Logged in as: <strong>John Doe</strong> <br />Team: Development Team
           </div>
         </div>
         <div class="nav-links">
@@ -153,10 +185,21 @@
       </div>
 
       <!-- Flash Messages -->
-      {% with messages = get_flashed_messages(with_categories=true) %} {% if
-      messages %} {% for category, message in messages %}
-      <div class="alert alert-{{ category }}">{{ message }}</div>
-      {% endfor %} {% endif %} {% endwith %}
+      <div
+        class="alert alert-success"
+        style="display: none"
+        id="success-alert"
+      ></div>
+      <div
+        class="alert alert-warning"
+        style="display: none"
+        id="warning-alert"
+      ></div>
+      <div
+        class="alert alert-error"
+        style="display: none"
+        id="error-alert"
+      ></div>
 
       <!-- Info Box -->
       <div class="info-box">
@@ -175,13 +218,7 @@
         <div class="form-row">
           <div class="form-group">
             <label for="start_date">Start Date:</label>
-            <input
-              type="date"
-              id="start_date"
-              name="start_date"
-              required
-              min="{{ moment().strftime('%Y-%m-%d') if moment else '' }}"
-            />
+            <input type="date" id="start_date" name="start_date" required />
             <div class="help-text">When does your leave start?</div>
           </div>
 
@@ -194,16 +231,47 @@
 
         <div class="form-group">
           <label for="reason">Reason for Leave:</label>
-          <select id="reason" name="reason" required>
-            <option value="">Select a reason...</option>
-            <option value="sick">🤒 Sick Leave</option>
-            <option value="vacation">🏖️ Vacation Leave</option>
-            <option value="personal">👤 Personal Leave</option>
-            <option value="family">👨‍👩‍👧‍👦 Family Emergency</option>
-            <option value="medical">🏥 Medical Appointment</option>
-          </select>
+          <textarea
+            id="reason"
+            name="reason"
+            required
+            placeholder="Please describe the reason for your leave request..."
+            maxlength="500"
+          ></textarea>
+          <div class="char-counter">
+            <span id="char-count">0</span>/500 characters
+          </div>
           <div class="help-text">
-            Choose the category that best describes your leave
+            Be specific about your leave reason to help with faster processing
+          </div>
+          <div class="reason-suggestions">
+            <strong>Quick suggestions:</strong>
+            <div style="margin-top: 4px">
+              <span class="reason-tag" data-reason="Sick leave - feeling unwell"
+                >🤒 Sick Leave</span
+              >
+              <span
+                class="reason-tag"
+                data-reason="Vacation - personal time off"
+                >🏖️ Vacation</span
+              >
+              <span
+                class="reason-tag"
+                data-reason="Personal matters requiring attention"
+                >👤 Personal</span
+              >
+              <span
+                class="reason-tag"
+                data-reason="Family emergency - immediate attention required"
+                >👨‍👩‍👧‍👦 Family Emergency</span
+              >
+              <span class="reason-tag" data-reason="Medical appointment"
+                >🏥 Medical Appointment</span
+              >
+              <span class="reason-tag" data-reason="Mental health day"
+                >🧠 Mental Health</span
+              >
+            </div>
           </div>
         </div>
 
@@ -216,11 +284,38 @@
       document.addEventListener("DOMContentLoaded", function () {
         const startDate = document.getElementById("start_date");
         const endDate = document.getElementById("end_date");
+        const reasonTextarea = document.getElementById("reason");
+        const charCount = document.getElementById("char-count");
         const today = new Date().toISOString().split("T")[0];
 
         // Set minimum date to today
         startDate.min = today;
         endDate.min = today;
+
+        // Character counter for reason textarea
+        reasonTextarea.addEventListener("input", function () {
+          const currentLength = this.value.length;
+          charCount.textContent = currentLength;
+
+          if (currentLength > 450) {
+            charCount.style.color = "#dc3545";
+          } else if (currentLength > 400) {
+            charCount.style.color = "#ffc107";
+          } else {
+            charCount.style.color = "#666";
+          }
+        });
+
+        // Quick reason suggestions
+        document.querySelectorAll(".reason-tag").forEach((tag) => {
+          tag.addEventListener("click", function () {
+            const reason = this.getAttribute("data-reason");
+            reasonTextarea.value = reason;
+            reasonTextarea.focus();
+            // Trigger input event to update character counter
+            reasonTextarea.dispatchEvent(new Event("input"));
+          });
+        });
 
         startDate.addEventListener("change", function () {
           endDate.min = this.value;
@@ -259,6 +354,18 @@
             }`;
           }
         }
+
+        // Form validation
+        document.querySelector("form").addEventListener("submit", function (e) {
+          const reason = reasonTextarea.value.trim();
+          if (reason.length < 10) {
+            e.preventDefault();
+            alert(
+              "⚠️ Please provide a more detailed reason (at least 10 characters)"
+            );
+            reasonTextarea.focus();
+          }
+        });
       });
     </script>
   </body>

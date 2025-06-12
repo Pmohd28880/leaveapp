@@ -1,8 +1,8 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, login_user, login_required, current_user, logout_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, Leave, Team, LeaveTransaction, LeaveType, LeaveBalance, Organization, Department
-from datetime import datetime, timedelta, date
+from models import db, User, Leave, Team
+from datetime import datetime, timedelta
 import os
 import logging
 from logging.handlers import RotatingFileHandler
@@ -15,8 +15,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy import text  # Add this import
 import calendar
-from difflib import SequenceMatcher
-import re
+
 # OpenAI Agents SDK imports
 from agents import Agent, Runner, function_tool
 from pydantic import BaseModel, Field
@@ -630,184 +629,60 @@ def get_team_analysis_for_agent(team_id: int, start_date: str, end_date: str) ->
 
 @function_tool
 def get_user_leave_history(user_id: int) -> Dict:
-    """Retrieve and analyze user's leave history patterns with enhanced sick leave detection"""
+    """Retrieve and analyze user's leave history patterns"""
     try:
         logger.info(f"🔍 Analyzing leave history for user {user_id}")
 
-        with app.app_context():
-            # Get ALL leave requests in the last 12 months (not just 10)
-            cutoff_date = datetime.utcnow() - timedelta(days=365)
-            # Convert to date for comparison if needed
-            cutoff_date_only = cutoff_date.date()
+        with app.app_context():  # Ensure database session is active
+            # Get recent leave requests
+            recent_leaves = Leave.query.filter_by(user_id=user_id).order_by(
+                Leave.start_date.desc()).limit(10).all()
 
-            all_leaves = Leave.query.filter(
-                Leave.user_id == user_id,
-                Leave.start_date >= cutoff_date_only
-            ).order_by(Leave.start_date.desc()).all()
-
-            # Get recent leave requests (last 3 months for pattern detection)
-            recent_cutoff = datetime.utcnow() - timedelta(days=90)
-            recent_cutoff_date_only = recent_cutoff.date()
-
-            recent_leaves = [
-                leave for leave in all_leaves if leave.start_date >= recent_cutoff_date_only]
-
-            if all_leaves:
-                # Calculate overall statistics
+            if recent_leaves:
                 total_days = sum(
-                    [(leave.end_date - leave.start_date).days + 1 for leave in all_leaves])
-                total_requests = len(all_leaves)
+                    [(leave.end_date - leave.start_date).days + 1 for leave in recent_leaves])
+                sick_count = len(
+                    [leave for leave in recent_leaves if 'sick' in leave.reason.lower()])
                 approved_count = len(
-                    [leave for leave in all_leaves if leave.status == 'Approved'])
+                    [leave for leave in recent_leaves if leave.status == 'Approved'])
 
-                # Sick leave analysis - Enhanced detection
-                sick_leaves = [
-                    leave for leave in all_leaves if 'sick' in leave.reason.lower()]
-                recent_sick_leaves = [
-                    leave for leave in recent_leaves if 'sick' in leave.reason.lower()]
+                # Calculate patterns
+                avg_days_per_request = total_days / \
+                    len(recent_leaves) if recent_leaves else 0
+                approval_rate = (approved_count / len(recent_leaves)
+                                 ) * 100 if recent_leaves else 0
 
-                # Calculate sick leave patterns
-                sick_count_total = len(sick_leaves)
-                sick_count_recent = len(recent_sick_leaves)
-                sick_days_total = sum(
-                    [(leave.end_date - leave.start_date).days + 1 for leave in sick_leaves])
-                sick_days_recent = sum(
-                    [(leave.end_date - leave.start_date).days + 1 for leave in recent_sick_leaves])
-
-                # Frequency analysis
-                if recent_sick_leaves:
-                    days_between_sick_leaves = []
-                    for i in range(len(recent_sick_leaves) - 1):
-                        # Ensure we're working with date objects for calculation
-                        start_date = recent_sick_leaves[i].start_date
-                        end_date = recent_sick_leaves[i+1].end_date
-
-                        # Convert to date objects if they're datetime objects
-                        if hasattr(start_date, 'date'):
-                            start_date = start_date.date()
-                        if hasattr(end_date, 'date'):
-                            end_date = end_date.date()
-
-                        diff = (start_date - end_date).days
-                        days_between_sick_leaves.append(diff)
-                    avg_gap_between_sick = sum(days_between_sick_leaves) / len(
-                        days_between_sick_leaves) if days_between_sick_leaves else 0
-                else:
-                    avg_gap_between_sick = 0
-
-                # Pattern classification with stricter thresholds
-                pattern_flags = []
-                risk_score = 0
-
-                # Flag 1: Excessive sick leave frequency (>4 in 3 months)
-                if sick_count_recent > 4:
-                    pattern_flags.append("excessive_sick_frequency")
-                    risk_score += 30
-
-                # Flag 2: High sick leave percentage (>60% of all leaves are sick)
-                sick_percentage = (
-                    sick_count_total / total_requests) * 100 if total_requests > 0 else 0
-                if sick_percentage > 60:
-                    pattern_flags.append("high_sick_percentage")
-                    risk_score += 25
-
-                # Flag 3: Short gaps between sick leaves (<7 days average)
-                if recent_sick_leaves and avg_gap_between_sick < 7:
-                    pattern_flags.append("frequent_sick_pattern")
-                    risk_score += 20
-
-                # Flag 4: Excessive total sick days (>15 days in 3 months)
-                if sick_days_recent > 15:
-                    pattern_flags.append("excessive_sick_days")
-                    risk_score += 25
-
-                # Flag 5: Monday/Friday pattern detection
-                monday_friday_sick = []
-                for leave in recent_sick_leaves:
-                    start_date = leave.start_date
-                    # Convert to date object if it's a datetime object
-                    if hasattr(start_date, 'date'):
-                        start_date = start_date.date()
-                    # 0=Monday, 4=Friday
-                    if start_date.weekday() in [0, 4]:
-                        monday_friday_sick.append(leave)
-
-                if len(monday_friday_sick) >= 3:
-                    pattern_flags.append("weekend_adjacent_pattern")
-                    risk_score += 15
-
-                # Flag 6: Single day sick leaves (potential abuse)
-                single_day_sick = [leave for leave in recent_sick_leaves
-                                   if (leave.end_date - leave.start_date).days == 0]
-                if len(single_day_sick) >= 4:
-                    pattern_flags.append("frequent_single_day_sick")
-                    risk_score += 20
-
-                # Determine overall pattern classification
-                if risk_score >= 50:
-                    pattern = "high_risk_abuse_pattern"
-                elif risk_score >= 30:
-                    pattern = "concerning_sick_leave_pattern"
-                elif risk_score >= 15:
-                    pattern = "elevated_sick_leave_usage"
-                elif sick_count_recent > 2:
-                    pattern = "moderate_sick_leave_usage"
+                # Determine pattern classification (relaxed threshold)
+                if total_days > 60:  # Changed from 45 to 60
+                    pattern = "high_usage"
+                elif sick_count > len(recent_leaves) * 0.8:
+                    pattern = "frequent_sick_leave"
+                elif avg_days_per_request > 10:
+                    pattern = "long_duration_requests"
                 else:
                     pattern = "normal"
 
-                # Generate recommendations based on pattern
-                recommendations = []
-                if "excessive_sick_frequency" in pattern_flags:
-                    recommendations.append("require_medical_certification")
-                if "frequent_sick_pattern" in pattern_flags:
-                    recommendations.append("manager_review_required")
-                if "weekend_adjacent_pattern" in pattern_flags:
-                    recommendations.append("pattern_verification_needed")
-                if risk_score >= 50:
-                    recommendations.append("escalate_to_hr")
-                    recommendations.append("possible_disciplinary_review")
-
-                # Handle last_leave_date safely
-                last_leave_date = 'N/A'
-                if all_leaves and all_leaves[0].end_date:
-                    end_date = all_leaves[0].end_date
-                    if hasattr(end_date, 'strftime'):
-                        last_leave_date = end_date.strftime('%Y-%m-%d')
-                    else:
-                        last_leave_date = str(end_date)
-
                 return {
-                    'total_recent_days': sum([(leave.end_date - leave.start_date).days + 1 for leave in recent_leaves]),
+                    'total_recent_days': total_days,
                     'total_requests': len(recent_leaves),
-                    'total_annual_requests': total_requests,
-                    'sick_leave_count_recent': sick_count_recent,
-                    'sick_leave_count_total': sick_count_total,
-                    'sick_days_recent': sick_days_recent,
-                    'sick_days_total': sick_days_total,
-                    'sick_leave_percentage': round(sick_percentage, 2),
-                    'approval_rate': (approved_count / total_requests) * 100 if total_requests else 0,
-                    'average_gap_between_sick_leaves': round(avg_gap_between_sick, 1),
+                    'sick_leave_count': sick_count,
+                    'approval_rate': approval_rate,
+                    'average_duration': avg_days_per_request,
                     'pattern_classification': pattern,
-                    'pattern_flags': pattern_flags,
-                    'risk_score': risk_score,
-                    'recommendations': recommendations,
-                    'last_leave_date': last_leave_date,
-                    'recent_sick_reasons': [leave.reason for leave in recent_sick_leaves[:5]],
-                    'single_day_sick_count': len(single_day_sick),
-                    'monday_friday_sick_count': len(monday_friday_sick)
+                    'last_leave_date': recent_leaves[0].end_date.strftime('%Y-%m-%d') if recent_leaves[0].end_date else 'N/A',
+                    'recent_reasons': [leave.reason for leave in recent_leaves[:3]]
                 }
             else:
                 return {
                     'total_recent_days': 0,
                     'total_requests': 0,
                     'pattern_classification': 'new_employee',
-                    'risk_score': 0,
                     'message': 'No previous leave history found'
                 }
 
     except Exception as e:
         logger.error(f"Error analyzing user history: {str(e)}")
-        return {'error': str(e), 'pattern_classification': 'unknown', 'risk_score': 100}
+        return {'error': str(e), 'pattern_classification': 'unknown'}
 
 
 @function_tool
@@ -1191,258 +1066,6 @@ def analyze_team_availability(team_id: int, start_date: str, end_date: str) -> D
 
 
 @function_tool
-def analyze_leave_balance(user_id: int, leave_type_id: int, days_requested: float, year: int = None) -> Dict:
-    """Analyze leave balance for a specific user and leave type"""
-    try:
-        logger.info(
-            f"💰 Analyzing leave balance for user {user_id}, leave type {leave_type_id}")
-
-        with app.app_context():
-            # Get current year if not specified
-            if year is None:
-                year = datetime.now().year
-
-            # Get user
-            user = User.query.get(user_id)
-            if not user:
-                logger.error(f"User {user_id} not found")
-                return {
-                    'error': 'User not found',
-                    'can_take_leave': False,
-                    'balance_status': 'error'
-                }
-
-            # Get leave type
-            leave_type = LeaveType.query.get(leave_type_id)
-            if not leave_type:
-                logger.error(f"Leave type {leave_type_id} not found")
-                return {
-                    'error': 'Leave type not found',
-                    'can_take_leave': False,
-                    'balance_status': 'error'
-                }
-
-            # Get or create leave balance for this user, leave type, and year
-            leave_balance = LeaveBalance.query.filter_by(
-                user_id=user_id,
-                leave_type_id=leave_type_id,
-                year=year
-            ).first()
-
-            if not leave_balance:
-                # Initialize leave balance if it doesn't exist
-                logger.info(
-                    f"Creating new leave balance for user {user_id}, leave type {leave_type_id}")
-                leave_balance = LeaveBalance(
-                    user_id=user_id,
-                    leave_type_id=leave_type_id,
-                    year=year,
-                    allocated_days=leave_type.default_allocation
-                )
-                db.session.add(leave_balance)
-                db.session.commit()
-
-            # Calculate current balance
-            current_balance = leave_balance.remaining_days
-            balance_after_request = current_balance - days_requested
-
-            logger.info(
-                f"Current balance: {current_balance}, After request: {balance_after_request}")
-
-            # Determine if leave can be taken
-            can_take_leave = False
-            balance_status = ""
-            warning_message = ""
-
-            if balance_after_request >= 0:
-                # Sufficient balance
-                can_take_leave = True
-                balance_status = "sufficient"
-            elif leave_type.can_be_negative:
-                # Negative balance allowed
-                can_take_leave = True
-                balance_status = "negative_allowed"
-                warning_message = f"This will result in a negative balance of {abs(balance_after_request)} days"
-            else:
-                # Insufficient balance and negative not allowed
-                can_take_leave = False
-                balance_status = "insufficient"
-                warning_message = f"Insufficient balance. You need {abs(balance_after_request)} more days"
-
-            # Calculate usage statistics
-            usage_percentage = (leave_balance.used_days / leave_balance.total_available) * \
-                100 if leave_balance.total_available > 0 else 0
-            pending_percentage = (leave_balance.pending_days / leave_balance.total_available) * \
-                100 if leave_balance.total_available > 0 else 0
-
-            # Determine risk level
-            risk_level = "low"
-            if balance_after_request < 0 and not leave_type.can_be_negative:
-                risk_level = "critical"
-            elif balance_after_request < 0:
-                risk_level = "high"  # Negative but allowed
-            elif balance_after_request <= leave_balance.total_available * 0.1:
-                risk_level = "medium"  # Less than 10% remaining
-
-            logger.info(
-                f"Balance analysis complete - Can take leave: {can_take_leave}, Status: {balance_status}")
-
-            return {
-                'user_id': user_id,
-                'username': user.username,
-                'leave_type_name': leave_type.name,
-                'leave_type_code': leave_type.code,
-                'year': year,
-                'days_requested': days_requested,
-                'can_take_leave': can_take_leave,
-                'balance_status': balance_status,
-                'warning_message': warning_message,
-                'risk_level': risk_level,
-                'balance_details': {
-                    'current_balance': current_balance,
-                    'balance_after_request': balance_after_request,
-                    'allocated_days': leave_balance.allocated_days,
-                    'used_days': leave_balance.used_days,
-                    'pending_days': leave_balance.pending_days,
-                    'carried_over': leave_balance.carried_over,
-                    'total_available': leave_balance.total_available
-                },
-                'leave_type_settings': {
-                    'negative_allowed': leave_type.can_be_negative,
-                    'max_carryover': leave_type.max_carryover,
-                    'requires_approval': leave_type.requires_approval
-                },
-                'usage_statistics': {
-                    'usage_percentage': round(usage_percentage, 2),
-                    'pending_percentage': round(pending_percentage, 2),
-                    'remaining_percentage': round((current_balance / leave_balance.total_available) * 100, 2) if leave_balance.total_available > 0 else 0
-                }
-            }
-
-    except Exception as e:
-        logger.error(f"Error analyzing leave balance: {str(e)}")
-        return {
-            'error': str(e),
-            'can_take_leave': False,
-            'balance_status': 'error',
-            'risk_level': 'critical'
-        }
-
-
-@function_tool
-def get_comprehensive_leave_analysis(user_id: int, leave_type_id: int, days_requested: float,
-                                     start_date: str, end_date: str, year: int = None) -> Dict:
-    """Get comprehensive leave analysis including balance and team impact"""
-    try:
-        logger.info(
-            f"🔍 Performing comprehensive leave analysis for user {user_id}")
-
-        with app.app_context():
-            # Get user to determine team
-            user = User.query.get(user_id)
-            if not user:
-                return {
-                    'error': 'User not found',
-                    'analysis_complete': False
-                }
-
-            # Analyze leave balance
-            balance_analysis = analyze_leave_balance(
-                user_id, leave_type_id, days_requested, year)
-
-            # Analyze team availability
-            team_analysis = analyze_team_availability(
-                user.team_id, start_date, end_date)
-
-            # Combine analyses for overall recommendation
-            overall_recommendation = "approved"
-            blocking_factors = []
-
-            # Check balance issues
-            if not balance_analysis.get('can_take_leave', False):
-                overall_recommendation = "rejected"
-                blocking_factors.append("Insufficient leave balance")
-            elif balance_analysis.get('risk_level') == 'high':
-                overall_recommendation = "conditional"
-                blocking_factors.append(
-                    "Leave request results in negative balance")
-
-            # Check team impact
-            if team_analysis.get('impact_level') == 'critical':
-                if overall_recommendation == "approved":
-                    overall_recommendation = "conditional"
-                blocking_factors.append("Critical impact on team availability")
-            elif team_analysis.get('impact_level') == 'high':
-                if overall_recommendation == "approved":
-                    overall_recommendation = "review_required"
-                blocking_factors.append("High impact on team availability")
-
-            # Calculate overall risk score (1-10)
-            risk_score = 1
-            if balance_analysis.get('risk_level') == 'critical':
-                risk_score += 4
-            elif balance_analysis.get('risk_level') == 'high':
-                risk_score += 3
-            elif balance_analysis.get('risk_level') == 'medium':
-                risk_score += 2
-
-            if team_analysis.get('impact_level') == 'critical':
-                risk_score += 4
-            elif team_analysis.get('impact_level') == 'high':
-                risk_score += 2
-            elif team_analysis.get('impact_level') == 'medium':
-                risk_score += 1
-
-            risk_score = min(risk_score, 10)  # Cap at 10
-
-            logger.info(
-                f"Comprehensive analysis complete - Recommendation: {overall_recommendation}")
-
-            return {
-                'analysis_complete': True,
-                'user_info': {
-                    'user_id': user_id,
-                    'username': user.username,
-                    'team_name': user.user_team.name if user.user_team else 'No Team'
-                },
-                'leave_request': {
-                    'days_requested': days_requested,
-                    'start_date': start_date,
-                    'end_date': end_date
-                },
-                'balance_analysis': balance_analysis,
-                'team_analysis': team_analysis,
-                'overall_assessment': {
-                    'recommendation': overall_recommendation,
-                    'risk_score': risk_score,
-                    'blocking_factors': blocking_factors,
-                    'approval_likelihood': self._calculate_approval_likelihood(overall_recommendation, risk_score)
-                }
-            }
-
-    except Exception as e:
-        logger.error(f"Error in comprehensive leave analysis: {str(e)}")
-        return {
-            'error': str(e),
-            'analysis_complete': False
-        }
-
-
-def _calculate_approval_likelihood(recommendation: str, risk_score: int) -> str:
-    """Calculate likelihood of approval based on recommendation and risk score"""
-    if recommendation == "approved" and risk_score <= 3:
-        return "very_high"
-    elif recommendation == "approved" and risk_score <= 5:
-        return "high"
-    elif recommendation in ["conditional", "review_required"] and risk_score <= 6:
-        return "medium"
-    elif recommendation in ["conditional", "review_required"]:
-        return "low"
-    else:
-        return "very_low"
-
-
-@function_tool
 def assess_business_calendar_impact(start_date: str, end_date: str) -> Dict:
     """Assess impact based on business calendar and critical periods"""
     try:
@@ -1504,339 +1127,56 @@ def assess_business_calendar_impact(start_date: str, end_date: str) -> Dict:
 
 
 @function_tool
-def get_similar_leave_decisions(reason: str, duration_days: int, user_id: int,
-                                team_id: int = None, leave_start_date: str = None) -> Dict:
-    """Find similar past leave decisions with enhanced similarity analysis"""
+def get_similar_leave_decisions(reason: str, duration_days: int, user_id: int) -> Dict:
+    """Find similar past leave decisions for precedent analysis"""
     try:
-        # Enhanced input validation
         if not reason or not isinstance(duration_days, int) or duration_days <= 0:
             return {
                 'similar_cases_found': 0,
                 'precedents': [],
                 'historical_approval_rate': 0,
-                'recommendation': 'Invalid input parameters',
-                'confidence_score': 0
+                'recommendation': 'Invalid input parameters'
             }
-
         logger.info(
-            f"🔍 Enhanced precedent analysis for: {reason}, {duration_days} days, user {user_id}")
+            f"🔍 Finding similar decisions for {reason}, {duration_days} days")
 
-        with app.app_context():
-            # Get user details for better matching
-            current_user = User.query.get(user_id)
-            user_role = getattr(current_user, 'role',
-                                'employee') if current_user else 'employee'
-            user_team_id = getattr(
-                current_user, 'team_id', team_id) if current_user else team_id
+        with app.app_context():  # Ensure database session
+            # Find leaves with similar characteristics
+            similar_leaves = Leave.query.filter(
+                Leave.user_id != user_id,
+                Leave.reason.contains(reason.split()[0])
+            ).limit(5).all()
 
-            # Build more sophisticated query
-            query = Leave.query.filter(Leave.user_id != user_id)
+            if not similar_leaves:
+                return {'message': 'No similar cases found', 'precedents': []}
 
-            # Add team context if available
-            if user_team_id:
-                team_members = User.query.filter_by(team_id=user_team_id).all()
-                team_user_ids = [u.id for u in team_members]
-                # Include both team members and similar roles
-                query = query.filter(
-                    db.or_(
-                        Leave.user_id.in_(team_user_ids),
-                        User.role == user_role
-                    )
-                ).join(User, Leave.user_id == User.id)
-
-            # Get broader set for analysis
-            all_leaves = query.limit(50).all()
-
-            if not all_leaves:
-                return {
-                    'similar_cases_found': 0,
-                    'precedents': [],
-                    'historical_approval_rate': 0,
-                    'recommendation': 'No historical data available',
-                    'confidence_score': 0
-                }
-
-            # Enhanced similarity analysis
             precedents = []
-            reason_keywords = extract_keywords(reason)
+            for leave in similar_leaves:
+                leave_duration = (leave.end_date - leave.start_date).days + 1
+                precedents.append({
+                    'duration': leave_duration,
+                    'reason': leave.reason,
+                    'status': leave.status,
+                    'decision_reason': leave.decision_reason,
+                    'similarity_score': max(0, 100 - abs(leave_duration - duration_days) * 5)
+                })
 
-            for leave in all_leaves:
-                similarity_score = calculate_comprehensive_similarity(
-                    leave, reason, reason_keywords, duration_days,
-                    leave_start_date, user_team_id, user_role
-                )
-
-                if similarity_score > 20:  # Only include reasonably similar cases
-                    leave_duration = (
-                        leave.end_date - leave.start_date).days + 1
-                    leave_user = User.query.get(leave.user_id)
-
-                    precedent = {
-                        'duration': leave_duration,
-                        'reason': leave.reason,
-                        'status': leave.status,
-                        'decision_reason': leave.decision_reason or 'No reason provided',
-                        'similarity_score': round(similarity_score, 1),
-                        'user_role': getattr(leave_user, 'role', 'unknown') if leave_user else 'unknown',
-                        'same_team': getattr(leave_user, 'team_id', None) == user_team_id if leave_user else False,
-                        'created_at': leave.created_at.strftime('%Y-%m-%d') if leave.created_at else 'unknown',
-                        'seasonal_match': is_seasonal_match(leave.start_date, leave_start_date),
-                        'match_factors': get_match_factors(leave, reason, reason_keywords, duration_days)
-                    }
-                    precedents.append(precedent)
-
-            # Sort by similarity score
+            # Sort by similarity
             precedents.sort(key=lambda x: x['similarity_score'], reverse=True)
 
-            # Calculate weighted approval rate (more recent and similar cases have higher weight)
-            approval_rate = calculate_weighted_approval_rate(precedents)
-
-            # Generate enhanced recommendation
-            recommendation_data = generate_enhanced_recommendation(
-                precedents, approval_rate, duration_days, reason
-            )
+            approval_rate = len(
+                [p for p in precedents if p['status'] == 'Approved']) / len(precedents) * 100
 
             return {
                 'similar_cases_found': len(precedents),
-                'precedents': precedents[:5],  # Return top 5 most similar
-                'historical_approval_rate': round(approval_rate, 1),
-                'recommendation': recommendation_data['recommendation'],
-                'confidence_score': recommendation_data['confidence'],
-                'analysis_summary': recommendation_data['summary'],
-                'risk_factors': recommendation_data['risk_factors'],
-                'supporting_factors': recommendation_data['supporting_factors']
+                'precedents': precedents[:3],
+                'historical_approval_rate': approval_rate,
+                'recommendation': 'Favor approval' if approval_rate > 70 else 'Standard review' if approval_rate > 40 else 'Careful review'
             }
 
     except Exception as e:
-        logger.error(f"Error in enhanced precedent analysis: {str(e)}")
-        return {
-            'error': str(e),
-            'similar_cases_found': 0,
-            'precedents': [],
-            'historical_approval_rate': 0,
-            'recommendation': 'Error in analysis',
-            'confidence_score': 0
-        }
-
-
-def extract_keywords(reason: str) -> List[str]:
-    """Extract meaningful keywords from leave reason"""
-    # Common leave reason keywords
-    important_keywords = [
-        'medical', 'surgery', 'hospital', 'emergency', 'family', 'wedding',
-        'vacation', 'personal', 'sick', 'maternity', 'paternity', 'bereavement',
-        'conference', 'training', 'relocation', 'honeymoon', 'graduation'
-    ]
-
-    reason_lower = reason.lower()
-    keywords = []
-
-    # Extract important keywords
-    for keyword in important_keywords:
-        if keyword in reason_lower:
-            keywords.append(keyword)
-
-    # Extract other meaningful words (length > 3, not common words)
-    common_words = {'the', 'and', 'for', 'with',
-                    'have', 'will', 'need', 'want', 'going'}
-    words = re.findall(r'\b\w{4,}\b', reason_lower)
-    for word in words:
-        if word not in common_words and word not in keywords:
-            keywords.append(word)
-
-    return keywords[:5]  # Return top 5 keywords
-
-
-def calculate_comprehensive_similarity(leave, reason, reason_keywords, duration_days,
-                                       leave_start_date, user_team_id, user_role) -> float:
-    """Calculate comprehensive similarity score"""
-    score = 0
-    max_score = 0
-
-    # 1. Reason similarity (40% weight)
-    reason_sim = calculate_reason_similarity(
-        leave.reason, reason, reason_keywords)
-    score += reason_sim * 0.4
-    max_score += 40
-
-    # 2. Duration similarity (25% weight)
-    leave_duration = (leave.end_date - leave.start_date).days + 1
-    duration_diff = abs(leave_duration - duration_days)
-    # Penalty increases with difference
-    duration_sim = max(0, 100 - duration_diff * 10)
-    score += duration_sim * 0.25
-    max_score += 25
-
-    # 3. Team context (20% weight)
-    leave_user = User.query.get(leave.user_id)
-    if leave_user:
-        if getattr(leave_user, 'team_id', None) == user_team_id:
-            score += 20 * 0.2  # Same team
-        elif getattr(leave_user, 'role', None) == user_role:
-            score += 15 * 0.2  # Same role
-        else:
-            score += 5 * 0.2   # Different context
-    max_score += 20
-
-    # 4. Recency (15% weight) - more recent decisions are more relevant
-    if leave.created_at:
-        days_ago = (datetime.now() - leave.created_at).days
-        recency_score = max(0, 100 - days_ago / 10)  # Decays over time
-        score += recency_score * 0.15
-    max_score += 15
-
-    return (score / max_score) * 100 if max_score > 0 else 0
-
-
-def calculate_reason_similarity(leave_reason: str, current_reason: str, keywords: List[str]) -> float:
-    """Calculate similarity between leave reasons"""
-    # Exact match
-    if leave_reason.lower() == current_reason.lower():
-        return 100
-
-    # Sequence similarity
-    seq_sim = SequenceMatcher(
-        None, leave_reason.lower(), current_reason.lower()).ratio() * 100
-
-    # Keyword overlap
-    leave_reason_lower = leave_reason.lower()
-    keyword_matches = sum(
-        1 for keyword in keywords if keyword in leave_reason_lower)
-    keyword_sim = (keyword_matches / len(keywords)) * 100 if keywords else 0
-
-    # Combined similarity (weighted average)
-    return (seq_sim * 0.6 + keyword_sim * 0.4)
-
-
-def is_seasonal_match(leave_date, current_date_str) -> bool:
-    """Check if leaves are in similar time periods"""
-    if not current_date_str or not leave_date:
-        return False
-
-    try:
-        current_date = datetime.strptime(current_date_str, '%Y-%m-%d').date()
-        # Consider same month or adjacent months as seasonal match
-        month_diff = abs(leave_date.month - current_date.month)
-        return month_diff <= 1 or month_diff >= 11  # Handle Dec-Jan case
-    except:
-        return False
-
-
-def get_match_factors(leave, reason, keywords, duration_days) -> List[str]:
-    """Get list of factors that contributed to the match"""
-    factors = []
-
-    leave_duration = (leave.end_date - leave.start_date).days + 1
-
-    # Duration factors
-    if abs(leave_duration - duration_days) <= 1:
-        factors.append("Exact duration match")
-    elif abs(leave_duration - duration_days) <= 3:
-        factors.append("Similar duration")
-
-    # Reason factors
-    leave_reason_lower = leave.reason.lower()
-    reason_lower = reason.lower()
-
-    if any(keyword in leave_reason_lower for keyword in keywords):
-        factors.append("Keyword match in reason")
-
-    if SequenceMatcher(None, leave_reason_lower, reason_lower).ratio() > 0.7:
-        factors.append("Similar reason description")
-
-    return factors
-
-
-def calculate_weighted_approval_rate(precedents: List[Dict]) -> float:
-    """Calculate approval rate with weights based on similarity"""
-    if not precedents:
-        return 0
-
-    total_weight = 0
-    weighted_approvals = 0
-
-    for precedent in precedents:
-        weight = precedent['similarity_score'] / 100  # Normalize to 0-1
-        total_weight += weight
-
-        if precedent['status'] == 'Approved':
-            weighted_approvals += weight
-
-    return (weighted_approvals / total_weight) * 100 if total_weight > 0 else 0
-
-
-def generate_enhanced_recommendation(precedents: List[Dict], approval_rate: float,
-                                     duration_days: int, reason: str) -> Dict:
-    """Generate comprehensive recommendation with analysis"""
-
-    risk_factors = []
-    supporting_factors = []
-
-    # Analyze precedents for patterns
-    if precedents:
-        avg_similarity = sum(p['similarity_score']
-                             for p in precedents) / len(precedents)
-        recent_cases = [p for p in precedents if p.get(
-            'seasonal_match', False)]
-        same_team_cases = [p for p in precedents if p.get('same_team', False)]
-
-        # Risk factors
-        if approval_rate < 30:
-            risk_factors.append(
-                "Low historical approval rate for similar requests")
-
-        rejected_cases = [p for p in precedents if p['status'] == 'Rejected']
-        if len(rejected_cases) > len(precedents) / 2:
-            risk_factors.append("Majority of similar cases were rejected")
-
-        if duration_days > 10 and any('long duration' in p.get('decision_reason', '').lower()
-                                      for p in rejected_cases):
-            risk_factors.append(
-                "Long duration requests historically face scrutiny")
-
-        # Supporting factors
-        if approval_rate > 70:
-            supporting_factors.append(
-                "High historical approval rate for similar requests")
-
-        if same_team_cases and all(p['status'] == 'Approved' for p in same_team_cases):
-            supporting_factors.append(
-                "Similar requests from team members were approved")
-
-        if recent_cases and all(p['status'] == 'Approved' for p in recent_cases):
-            supporting_factors.append("Recent similar requests were approved")
-
-    # Generate recommendation
-    if approval_rate >= 80:
-        recommendation = "Strong approval recommendation"
-        confidence = min(95, approval_rate)
-    elif approval_rate >= 60:
-        recommendation = "Favor approval with standard review"
-        confidence = min(80, approval_rate)
-    elif approval_rate >= 40:
-        recommendation = "Standard review process"
-        confidence = 60
-    elif approval_rate >= 20:
-        recommendation = "Careful review recommended"
-        confidence = 40
-    else:
-        recommendation = "High scrutiny recommended"
-        confidence = 20
-
-    # Adjust confidence based on data quality
-    if len(precedents) < 3:
-        # Lower confidence with less data
-        confidence = max(30, confidence - 20)
-
-    summary = f"Based on {len(precedents)} similar cases with {approval_rate:.1f}% approval rate"
-
-    return {
-        'recommendation': recommendation,
-        'confidence': round(confidence, 1),
-        'summary': summary,
-        'risk_factors': risk_factors,
-        'supporting_factors': supporting_factors
-    }
+        logger.error(f"Error finding similar decisions: {str(e)}")
+        return {'error': str(e)}
 
 # =====================================================
 # SPECIALIZED AGENTS
@@ -1853,30 +1193,21 @@ context_agent = Agent(
     1. Use available tools to gather comprehensive information
     2. Analyze patterns and identify potential concerns
     3. Provide structured assessment of the situation
-    4. Evaluate leave balance sufficiency and impact
 
     Focus on:
     - Employee leave patterns and history
-    - Leave balance adequacy and negative balance implications
     - Team impact and availability
     - Business timing considerations
     - Risk factors that need attention
 
-    Be thorough but efficient in your analysis. Always check leave balances
-    before making recommendations.
+    Be thorough but efficient in your analysis.
     """,
-    tools=[
-        get_user_leave_history,
-        analyze_team_availability,
-        analyze_leave_balance,  # NEW: Essential for balance checking
-        get_comprehensive_leave_analysis,  # NEW: Complete analysis
-        assess_business_calendar_impact,
-        get_similar_leave_decisions
-    ],
+    tools=[get_user_leave_history, analyze_team_availability,
+           assess_business_calendar_impact, get_similar_leave_decisions],
     output_type=ContextAnalysis
 )
 
-# Decision Making Agent - Enhanced with balance analysis
+# Decision Making Agent
 decision_agent = Agent(
     name="Leave Decision Maker",
     instructions="""
@@ -1885,41 +1216,23 @@ decision_agent = Agent(
     Core principles:
     1. Employee wellbeing is paramount
     2. Business continuity must be maintained
-    3. Leave balance sufficiency must be verified
-    4. Fairness and consistency in decisions
-    5. STRICT monitoring of sick leave abuse patterns
-    6. Transparency in reasoning
-    7. Escalate when human judgment is needed
-
-    SICK LEAVE SPECIFIC GUIDELINES:
-    - AUTOMATIC DENIAL for risk_score >= 50 (high abuse pattern)
-    - MANDATORY ESCALATION for risk_score >= 30 (concerning pattern)
-    - REQUIRE MEDICAL CERTIFICATE for risk_score >= 20
-    - FLAG for manager review if risk_score >= 15
-
-    Sick Leave Red Flags (MUST escalate or deny):
-    - More than 4 sick leave requests in 3 months
-    - More than 15 sick days in 3 months
-    - Average gap between sick leaves < 7 days
-    - >60% of all leave requests are sick leave
-    - Frequent Monday/Friday sick leave pattern (3+ times)
-    - Frequent single-day sick leaves (4+ times in 3 months)
+    3. Fairness and consistency in decisions
+    4. Transparency in reasoning
+    5. Escalate when human judgment is needed
 
     Decision guidelines:
-    - ALWAYS check leave balance first using analyze_leave_balance
-    - ALWAYS analyze leave history patterns for sick leave abuse
-    - For sick leave: Apply stricter scrutiny based on pattern analysis
-    - Approve when balance is sufficient, impact is manageable, request is reasonable AND no abuse patterns
-    - Consider negative balances only if leave type allows it AND no concerning patterns
-    - DENY when balance is insufficient AND negative not allowed
-    - DENY when abuse patterns are detected (risk_score >= 50)
-    - ESCALATE when concerning patterns detected (risk_score >= 30)
-    - ESCALATE when business impact is severe and no alternatives exist
-    - REQUIRE DOCUMENTATION for repeated sick leave (>3 in 3 months)
+    - Approve when impact is manageable and request is reasonable
+    - Deny only when business impact is severe and no alternatives exist
+    - Escalate for complex situations, policy exceptions, or high-risk scenarios
 
-    Balance considerations remain the same as before...
+    Consider:
+    - Employee's history and circumstances
+    - Team capacity and availability
+    - Business timing and critical periods
+    - Precedent from similar cases
+    - Company values of flexibility and employee support
 
-    Always provide clear, empathetic reasoning for your decisions, especially for sick leave denials.
+    Always provide clear, empathetic reasoning for your decisions.
 
     Output your decision in the following JSON format:
     {
@@ -1929,25 +1242,16 @@ decision_agent = Agent(
         "escalate": <true|false>,
         "agent_reasoning": "<detailed explanation>",
         "business_impact": "<low|medium|high|critical>",
-        "balance_impact": "<sufficient|negative_allowed|insufficient|critical>",
         "employee_considerations": "<employee wellbeing factors>",
         "precedent_used": "<reference if any>",
-        "recommended_actions": ["<action1>", "<action2>"],
-        "pattern_analysis": "<sick leave pattern concerns if any>",
-        "documentation_required": <true|false>
+        "recommended_actions": ["<action1>", "<action2>"]
     }
     """,
-    tools=[
-        get_user_leave_history,
-        analyze_team_availability,
-        analyze_leave_balance,
-        get_comprehensive_leave_analysis,
-        assess_business_calendar_impact,
-        get_similar_leave_decisions
-    ],
+    tools=[get_user_leave_history, analyze_team_availability,
+           assess_business_calendar_impact, get_similar_leave_decisions],
     output_type=LeaveDecision
 )
-# Escalation Agent - Enhanced with balance analysis
+# Escalation Agent
 escalation_agent = Agent(
     name="Leave Escalation Specialist",
     instructions="""
@@ -1959,63 +1263,38 @@ escalation_agent = Agent(
     - Unusual circumstances
     - Policy exceptions
     - High business impact situations
-    - Complex leave balance scenarios (negative balances, carryovers, etc.)
 
     Approach:
-    - Gather comprehensive context including detailed balance analysis
-    - Consider all stakeholders and balance implications
-    - Identify accommodation options for balance shortfalls
-    - Evaluate if negative balance approval is appropriate
+    - Gather comprehensive context
+    - Consider all stakeholders
+    - Identify accommodation options
     - Provide detailed analysis for human reviewers
-    - Suggest alternative solutions when possible (partial leave, unpaid leave, etc.)
+    - Suggest alternative solutions when possible
 
-    Balance escalation scenarios:
-    - Requests exceeding available balance when negative not allowed
-    - Large negative balance requests requiring special approval
-    - Complex multi-year balance calculations
-    - Unusual leave type combinations
-
-    Remember: Your goal is to find solutions that work for both employee and business,
-    including creative balance management solutions.
+    Remember: Your goal is to find solutions that work for both employee and business.
     """,
-    tools=[
-        get_user_leave_history,
-        analyze_team_availability,
-        analyze_leave_balance,  # NEW: Essential for complex scenarios
-        get_comprehensive_leave_analysis,  # NEW: Complete analysis
-        assess_business_calendar_impact,
-        get_similar_leave_decisions
-    ],
+    tools=[get_user_leave_history, analyze_team_availability,
+           assess_business_calendar_impact, get_similar_leave_decisions],
     output_type=LeaveDecision
 )
 
-# Triage Agent - Enhanced routing logic with balance considerations
+# Triage Agent (Entry point)
 triage_agent = Agent(
     name="Leave Request Triage",
     instructions="""
     You are the first point of contact for all leave requests. Your job is to:
 
     1. Quickly assess the complexity and sensitivity of the request
-    2. Perform initial balance check to understand constraints
-    3. CRITICALLY IMPORTANT: Analyze sick leave patterns for potential abuse
-    4. Route to the appropriate specialist agent (decision_agent or escalation_agent)
-    5. Provide a brief analysis of your routing decision
+    2. Route to the appropriate specialist agent (decision_agent or escalation_agent)
+    3. Provide a brief analysis of your routing decision
 
-    SICK LEAVE ROUTING RULES (CRITICAL):
-    - Risk Score >= 50: → AUTOMATIC escalation_agent (high abuse risk)
-    - Risk Score >= 30: → escalation_agent (concerning pattern)
-    - Risk Score >= 20: → decision_agent with medical certificate requirement flag
-    - Risk Score >= 15: → decision_agent with manager review flag
-    - 4+ sick leaves in 3 months: → escalation_agent (excessive frequency)
-    - Frequent Monday/Friday pattern: → escalation_agent (suspicious timing)
+    Routing guidelines:
 
-    Standard routing guidelines:
     → Standard Decision Agent (decision_agent) for:
-    - Routine vacation requests (≤14 days) with sufficient balance
-    - Standard sick leave (≤5 days) with LOW risk score (<15) and adequate balance
-    - Personal leave with clear reasons and available balance
+    - Routine vacation requests (≤14 days)
+    - Standard sick leave (≤5 days)
+    - Personal leave with clear reasons
     - Low team/business impact situations
-    - Negative balance requests where policy clearly allows it
 
     → Escalation Specialist (escalation_agent) for:
     - Extended leave requests (>14 days)
@@ -2023,12 +1302,8 @@ triage_agent = Agent(
     - Family crisis situations (>5 days)
     - Requests during critical business periods with high team impact
     - Employees with concerning leave patterns (>90 days in 12 months)
-    - SICK LEAVE ABUSE PATTERNS (risk score >= 30)
     - Policy exception requests
-    - High + critical business impact scenarios
-    - Balance-related escalations (same as before)
-
-    Always use analyze_leave_balance AND get_user_leave_history to inform your routing decision.
+    - High + critical business impact scenarios (both high impact AND critical timing)
 
     Output your decision in the following JSON format:
     {
@@ -2036,45 +1311,12 @@ triage_agent = Agent(
         "reason": "<brief reason for routing>",
         "confidence": <float between 0 and 1>,
         "escalate": <true|false>,
-        "balance_status": "<sufficient|negative_allowed|insufficient|needs_review>",
-        "pattern_risk_level": "<low|moderate|high|critical>",
-        "analysis": "<brief analysis of the request including balance and pattern considerations>"
+        "analysis": "<brief analysis of the request>"
     }
     """,
-    tools=[
-        analyze_leave_balance,
-        get_user_leave_history,  # CRITICAL: Must analyze patterns
-        get_comprehensive_leave_analysis
-    ],
     handoffs=[decision_agent, escalation_agent],
     output_type=RoutingDecision
 )
-
-# Enhanced RoutingDecision output type to include balance information
-
-
-@dataclass
-class EnhancedRoutingDecision:
-    route_to: str
-    reason: str
-    confidence: float
-    escalate: bool
-    balance_status: str  # NEW: Balance status indicator
-    analysis: str
-
-
-@dataclass
-class EnhancedLeaveDecision:
-    status: str
-    reason: str
-    confidence: float
-    escalate: bool
-    agent_reasoning: str
-    business_impact: str
-    balance_impact: str  # NEW: Balance impact indicator
-    employee_considerations: str
-    precedent_used: str
-    recommended_actions: List[str]
 
 
 @app.route('/')
@@ -2083,385 +1325,62 @@ def index():
         return redirect(url_for('dashboard'))
     return redirect(url_for('login'))
 
+# =====================================================
+# AGENTS SDK INTEGRATION CLASS
+# =====================================================
+
 
 class AgenticLeaveSystemSDK:
     def __init__(self):
         self.triage_agent = triage_agent
         self.context_agent = context_agent
         self.executor = ThreadPoolExecutor(max_workers=3)
-        with app.app_context():
+        with app.app_context():  # Ensure database session is initialized
             if not db.session:
                 db.session = db.create_scoped_session()
                 logger.info("Initialized new database session")
 
-    def process_leave_decision(self, leave_record, ai_decision: Dict) -> Dict:
-        """
-        Process the AI decision and update the leave request status and balance
-
-        Args:
-            leave_record: Either a Leave object or leave_id (int)
-            ai_decision: Dictionary containing AI decision
-        """
-        try:
-            with app.app_context():
-                # Handle different input types
-                if isinstance(leave_record, int):
-                    # It's a leave_id
-                    leave = Leave.query.get(leave_record)
-                    if not leave:
-                        logger.error(
-                            f"Leave record with ID {leave_record} not found")
-                        return {"error": f"Leave record {leave_record} not found in database"}
-                    logger.info(f"Found Leave object with ID: {leave.id}")
-
-                elif hasattr(leave_record, 'id') and hasattr(leave_record, 'status'):
-                    # It's already a Leave object from database
-                    leave = leave_record
-                    logger.info(
-                        f"Using existing Leave object with ID: {leave.id}")
-
-                else:
-                    # It's a LeaveRequest object, need to find the corresponding Leave
-                    leave = self._find_leave_record(leave_record)
-                    if not leave:
-                        logger.error(
-                            "Could not find Leave record for LeaveRequest")
-                        return {"error": "Leave request not found in database"}
-
-                # Get balance info before processing (MOVED INSIDE app_context)
-                balance_before = self.get_current_balance_info(
-                    leave.user_id,
-                    leave.leave_type_id,
-                    leave.start_date.year
-                )
-                logger.info(f"🔍 BALANCE BEFORE PROCESSING: {balance_before}")
-
-                old_status = leave.status
-                logger.info(
-                    f"Processing leave {leave.id} - Old status: {old_status}, New status: {ai_decision['status']}")
-
-                # Calculate leave days for balance update
-                leave_days = (leave.end_date - leave.start_date).days + 1
-                logger.info(f"Leave duration: {leave_days} days")
-
-                # Update leave status based on AI decision
-                if ai_decision['status'] == 'Approved':
-                    leave.status = 'Approved'
-                    leave.approved_at = datetime.utcnow()
-                    leave.decision_reason = ai_decision['reason']
-
-                    # Update the leave balance manually
-                    self._update_leave_balance_directly(
-                        leave, old_status, 'Approved', leave_days)
-                    logger.info(
-                        f"✅ Leave request {leave.id} approved and balance updated")
-
-                elif ai_decision['status'] in ['Denied', 'Rejected']:
-                    leave.status = 'Rejected'
-                    leave.decision_reason = ai_decision['reason']
-
-                    # Update balance (removes from pending)
-                    self._update_leave_balance_directly(
-                        leave, old_status, 'Rejected', leave_days)
-                    logger.info(
-                        f"❌ Leave request {leave.id} rejected and balance updated")
-
-                elif ai_decision['status'] == 'Escalate':
-                    # Keep as pending but add escalation flag
-                    leave.status = 'Pending'
-                    leave.decision_reason = f"Escalated: {ai_decision['reason']}"
-                    logger.info(
-                        f"⬆️ Leave request {leave.id} escalated for human review")
-
-                # Save changes
-                db.session.commit()
-
-                # Get balance info after processing (ADDED)
-                balance_after = self.get_current_balance_info(
-                    leave.user_id,
-                    leave.leave_type_id,
-                    leave.start_date.year
-                )
-                logger.info(f"🔍 BALANCE AFTER PROCESSING: {balance_after}")
-
-                return {
-                    "success": True,
-                    "leave_id": leave.id,
-                    "new_status": leave.status,
-                    "balance_updated": ai_decision['status'] in ['Approved', 'Rejected'],
-                    "balance_before": balance_before,  # ADDED
-                    "balance_after": balance_after    # ADDED
-                }
-
-        except Exception as e:
-            db.session.rollback()
-            logger.exception(f"Error processing leave decision: {str(e)}")
-            return {"error": f"Failed to process decision: {str(e)}"}
-
-    def _find_leave_record(self, leave_request):
-        """Helper method to find Leave record from LeaveRequest"""
-        leave = None
-
-        # Strategy 1: By leave_id
-        if hasattr(leave_request, 'leave_id') and leave_request.leave_id:
-            leave = Leave.query.get(leave_request.leave_id)
-            if leave:
-                logger.info(
-                    f"Found leave by leave_id: {leave_request.leave_id}")
-                return leave
-
-        # Strategy 2: By user_id, dates, and status
-        if hasattr(leave_request, 'user_id'):
-            leave = Leave.query.filter_by(
-                user_id=leave_request.user_id,
-                start_date=leave_request.start_date,
-                end_date=leave_request.end_date,
-                status='Pending'
-            ).order_by(Leave.created_at.desc()).first()
-
-            if leave:
-                logger.info(f"Found leave by user_id and dates: {leave.id}")
-                return leave
-
-        # Strategy 3: Most recent pending leave for user
-        if hasattr(leave_request, 'user_id'):
-            leave = Leave.query.filter_by(
-                user_id=leave_request.user_id,
-                status='Pending'
-            ).order_by(Leave.created_at.desc()).first()
-
-            if leave:
-                logger.info(f"Found most recent pending leave: {leave.id}")
-                return leave
-
-        return None
-
-    def _update_leave_balance_directly(self, leave, old_status: str, new_status: str, leave_days: int):
-        """
-        Directly update the leave balance in the LeaveBalance table
-        """
-        try:
-            # Get the leave balance record
-            leave_balance = LeaveBalance.query.filter_by(
-                user_id=leave.user_id,
-                leave_type_id=leave.leave_type_id,
-                year=leave.start_date.year if hasattr(
-                    leave.start_date, 'year') else datetime.now().year
-            ).first()
-
-            if not leave_balance:
-                logger.error(
-                    f"No leave balance found for user {leave.user_id}, leave type {leave.leave_type_id}")
-                return
-
-            # Calculate current remaining balance BEFORE update
-            remaining_before = leave_balance.allocated_days - \
-                leave_balance.used_days - leave_balance.pending_days
-
-            logger.info(f"BEFORE UPDATE:")
-            logger.info(f"  - Allocated: {leave_balance.allocated_days}")
-            logger.info(f"  - Used: {leave_balance.used_days}")
-            logger.info(f"  - Pending: {leave_balance.pending_days}")
-            logger.info(f"  - Remaining: {remaining_before}")
-            logger.info(f"  - Status Transition: {old_status} → {new_status}")
-            logger.info(f"  - Leave Days: {leave_days}")
-
-            # Handle status transitions
-            if old_status == 'Pending' and new_status == 'Approved':
-                # Move from pending to used
-                leave_balance.pending_days = max(
-                    0, leave_balance.pending_days - leave_days)
-                leave_balance.used_days += leave_days
-                logger.info(
-                    f"  - Action: Moved {leave_days} days from pending to used")
-
-            elif old_status == 'Pending' and new_status == 'Rejected':
-                # Remove from pending (no change to used)
-                leave_balance.pending_days = max(
-                    0, leave_balance.pending_days - leave_days)
-                logger.info(
-                    f"  - Action: Removed {leave_days} days from pending")
-
-            elif old_status in ['Approved', 'Rejected'] and new_status == 'Approved':
-                # Direct approval (not from pending) - this should be rare now
-                logger.warning(
-                    f"  - UNUSUAL: Direct approval without pending status")
-                leave_balance.used_days += leave_days
-                logger.info(
-                    f"  - Action: Added {leave_days} days directly to used")
-
-            elif old_status == 'Approved' and new_status == 'Rejected':
-                # Reverse approval - remove from used days
-                leave_balance.used_days = max(
-                    0, leave_balance.used_days - leave_days)
-                logger.info(
-                    f"  - Action: Removed {leave_days} days from used (reversal)")
-
-            # Calculate remaining balance AFTER update
-            remaining_after = leave_balance.allocated_days - \
-                leave_balance.used_days - leave_balance.pending_days
-
-            logger.info(f"AFTER UPDATE:")
-            logger.info(f"  - Allocated: {leave_balance.allocated_days}")
-            logger.info(f"  - Used: {leave_balance.used_days}")
-            logger.info(f"  - Pending: {leave_balance.pending_days}")
-            logger.info(f"  - Remaining: {remaining_after}")
-            logger.info(
-                f"  - Balance Change: {remaining_before} → {remaining_after}")
-
-            # Save the updated balance
-            db.session.add(leave_balance)
-            db.session.commit()  # Commit immediately to ensure changes persist
-
-            logger.info(f"✅ Balance update completed for user {leave.user_id}")
-
-        except Exception as e:
-            logger.error(f"Error updating leave balance directly: {str(e)}")
-            raise
-
-    def get_current_balance_info(self, user_id: int, leave_type_id: int, year: int = None) -> Dict:
-        """
-        Get current balance information with consistent calculation
-        """
-        if year is None:
-            year = datetime.now().year
-
-        leave_balance = LeaveBalance.query.filter_by(
-            user_id=user_id,
-            leave_type_id=leave_type_id,
-            year=year
-        ).first()
-
-        if not leave_balance:
-            return {
-                'allocated': 0,
-                'used': 0,
-                'pending': 0,
-                'remaining': 0,
-                'found': False
-            }
-
-        remaining = leave_balance.allocated_days - \
-            leave_balance.used_days - leave_balance.pending_days
-
-        return {
-            'allocated': leave_balance.allocated_days,
-            'used': leave_balance.used_days,
-            'pending': leave_balance.pending_days,
-            'remaining': remaining,
-            'found': True,
-            'balance_record_id': leave_balance.id
-        }
-
-    @staticmethod
-    def detect_leave_type(reason: str) -> int:
-        """
-        Detect appropriate leave type based on the reason provided
-        Returns the leave_type_id
-        """
-        reason_lower = reason.lower().strip()
-
-        # Define keywords for different leave types
-        leave_type_keywords = {
-            'sick': ['sick', 'illness', 'medical', 'doctor', 'hospital', 'surgery',
-                     'health', 'fever', 'flu', 'cold', 'unwell', 'treatment'],
-            'annual': ['vacation', 'holiday', 'annual', 'rest', 'break', 'travel',
-                       'family time', 'personal break', 'time off'],
-            'personal': ['personal', 'family', 'emergency', 'bereavement', 'funeral',
-                         'wedding', 'graduation', 'appointment', 'personal matter'],
-            'maternity': ['maternity', 'pregnancy', 'childbirth', 'newborn', 'baby'],
-            'paternity': ['paternity', 'father', 'newborn baby', 'child birth'],
-            'study': ['study', 'education', 'training', 'course', 'exam', 'learning'],
-            'compassionate': ['death', 'funeral', 'bereavement', 'family emergency', 'compassionate']
-        }
-
-        # Check each leave type for matching keywords
-        for leave_type_code, keywords in leave_type_keywords.items():
-            if any(keyword in reason_lower for keyword in keywords):
-                # Query database to get the leave type ID
-                leave_type = LeaveType.query.filter_by(
-                    # e.g., 'SL', 'AL', 'PL'
-                    code=leave_type_code.upper()[:2] + 'L',
-                    is_active=True
-                ).first()
-
-                if not leave_type:
-                    # Try with different code format
-                    leave_type = LeaveType.query.filter(
-                        LeaveType.name.ilike(f'%{leave_type_code}%'),
-                        LeaveType.is_active == True
-                    ).first()
-
-                if leave_type:
-                    logger.info(
-                        f"Detected leave type: {leave_type.name} (ID: {leave_type.id}) for reason: {reason}")
-                    return leave_type.id
-
-        # Default to Annual Leave if no specific type detected
-        default_leave_type = LeaveType.query.filter_by(
-            code='AL', is_active=True).first()
-        if not default_leave_type:
-            default_leave_type = LeaveType.query.filter_by(
-                is_active=True).first()
-
-        if default_leave_type:
-            logger.info(
-                f"Using default leave type: {default_leave_type.name} (ID: {default_leave_type.id}) for reason: {reason}")
-            return default_leave_type.id
-
-        # If no leave types exist, raise an error
-        raise ValueError("No active leave types found in the system")
-
     def make_intelligent_decision(self, leave_request: LeaveRequest, team_members: List, additional_context: Dict = None) -> Dict:
         """
-        Process leave request using OpenAI Agents SDK and apply the decision
-
-        NOTE: This method now returns the AI decision WITHOUT processing it.
-        The caller should save the Leave record first, then call process_leave_decision separately.
+        Process leave request using OpenAI Agents SDK
         """
         try:
             logger.info(
                 f"🤖 Starting Agents SDK analysis for user {leave_request.user_id}")
 
-            # Get AI decision
+            # Run the async processing in the thread executor
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                ai_decision = loop.run_until_complete(
+                result = loop.run_until_complete(
                     self._async_process_request(
                         leave_request, team_members, additional_context)
                 )
-
-                # Validate AI decision format
-                if isinstance(ai_decision, str):
-                    logger.warning(
-                        f"Unexpected output type: {type(ai_decision)}")
-                    ai_decision = {
+                # --- FIX: Ensure result is always a dict ---
+                if isinstance(result, str):
+                    logger.warning(f"Unexpected output type: {type(result)}")
+                    result = {
                         'status': 'Escalate',
-                        'reason': f"Unexpected AI response format: {ai_decision}",
+                        'reason': f"Unexpected AI response format: {result}",
                         'confidence': 0.5,
                         'escalate': True,
-                        'agent_reasoning': f"Output: {ai_decision}",
+                        'agent_reasoning': f"Output: {result}",
                         'business_impact': 'unknown',
                         'employee_considerations': 'format_error'
                     }
-                elif not isinstance(ai_decision, dict):
+                elif not isinstance(result, dict):
                     logger.warning(
-                        f"Completely unexpected output type: {type(ai_decision)}")
-                    ai_decision = {
+                        f"Completely unexpected output type: {type(result)}")
+                    result = {
                         'status': 'Escalate',
-                        'reason': f"AI returned unsupported type: {type(ai_decision)}",
+                        'reason': f"AI returned unsupported type: {type(result)}",
                         'confidence': 0.0,
                         'escalate': True,
-                        'agent_reasoning': f"Output: {ai_decision}",
+                        'agent_reasoning': f"Output: {result}",
                         'business_impact': 'unknown',
                         'employee_considerations': 'format_error'
                     }
-
-                # Return AI decision without processing
-                # The caller should save the Leave record and then call process_leave_decision
-                logger.info("🤖 Agents SDK Decision: %s", ai_decision)
-                return ai_decision
+                return result
 
             finally:
                 loop.close()
@@ -2475,110 +1394,8 @@ class AgenticLeaveSystemSDK:
                 'escalate': True,
                 'agent_reasoning': f'SDK Error: {str(e)}',
                 'business_impact': 'unknown',
-                'employee_considerations': 'system_error',
-                'error': str(e)
+                'employee_considerations': 'system_error'
             }
-
-    def process_leave_request_complete(self, leave_request: LeaveRequest, team_members: List, additional_context: Dict = None) -> Dict:
-        """
-        Complete workflow: Get AI decision, save Leave record, then process the decision
-        """
-        try:
-            # Step 1: Get AI decision (without processing)
-            ai_decision = self.make_intelligent_decision(
-                leave_request, team_members, additional_context)
-
-            # Step 2: Create and save the Leave record
-            with app.app_context():
-                # Detect leave type if not provided
-                leave_type_id = getattr(leave_request, 'leave_type_id', None)
-                if not leave_type_id:
-                    leave_type_id = self.detect_leave_type(
-                        leave_request.reason)
-
-                # Create Leave record
-                leave_record = Leave(
-                    user_id=leave_request.user_id,
-                    leave_type_id=leave_type_id,
-                    start_date=leave_request.start_date,
-                    end_date=leave_request.end_date,
-                    duration_days=leave_request.duration_days,
-                    reason=leave_request.reason,
-                    status='Pending',  # Always start as Pending
-                    created_at=datetime.utcnow()
-                )
-
-                # Add to session and commit to get the ID
-                db.session.add(leave_record)
-                db.session.commit()
-                db.session.refresh(leave_record)
-
-                logger.info(
-                    f"✅ Leave saved to database with ID: {leave_record.id}")
-
-                # CRITICAL FIX: Add pending days to balance when leave is created
-                self._add_pending_days_to_balance(leave_record)
-
-                # Step 3: Process the AI decision
-                processing_result = self.process_leave_decision(
-                    leave_record, ai_decision)
-
-                # Step 4: Combine results
-                final_result = {**ai_decision, **processing_result}
-                return final_result
-
-        except Exception as e:
-            logger.exception(
-                f"Error in complete leave request processing: {str(e)}")
-            return {
-                'status': 'Escalate',
-                'reason': f'System error during complete processing: {str(e)}',
-                'confidence': 0.0,
-                'escalate': True,
-                'error': str(e)
-            }
-
-    def _add_pending_days_to_balance(self, leave):
-        """
-        Add pending days to the balance when a leave request is created
-        """
-        try:
-            leave_days = (leave.end_date - leave.start_date).days + 1
-
-            # Get the leave balance record
-            leave_balance = LeaveBalance.query.filter_by(
-                user_id=leave.user_id,
-                leave_type_id=leave.leave_type_id,
-                year=leave.start_date.year
-            ).first()
-
-            if not leave_balance:
-                logger.error(
-                    f"No leave balance found for user {leave.user_id}, leave type {leave.leave_type_id}")
-                return
-
-            logger.info(f"ADDING PENDING DAYS:")
-            logger.info(f"  - User: {leave.user_id}")
-            logger.info(f"  - Leave Days: {leave_days}")
-            logger.info(f"  - Pending Before: {leave_balance.pending_days}")
-
-            # Add to pending days
-            leave_balance.pending_days += leave_days
-
-            logger.info(f"  - Pending After: {leave_balance.pending_days}")
-            logger.info(
-                f"  - Remaining Balance: {leave_balance.remaining_days}")
-
-            # Save the updated balance
-            db.session.add(leave_balance)
-            db.session.commit()
-
-            logger.info(
-                f"✅ Added {leave_days} pending days to balance for user {leave.user_id}")
-
-        except Exception as e:
-            logger.error(f"Error adding pending days to balance: {str(e)}")
-            raise
 
     async def _async_process_request(self, leave_request: LeaveRequest, team_members: List, additional_context: Dict = None) -> Dict:
         """Async processing of leave request with comprehensive validation"""
@@ -2776,10 +1593,15 @@ class AgenticLeaveSystemSDK:
             'validation_details': validation_result
         }
 
+        # Add validation warnings to the final result if any
         if validation_result.get('warnings'):
             final_result['validation_warnings'] = validation_result['warnings']
 
         return final_result
+
+# =====================================================
+# FLASK ROUTES
+# =====================================================
 
 
 @app.route('/test-log')
@@ -3481,259 +2303,6 @@ def health_check():
         }, 500
 
 
-def create_sample_data():
-    """Create comprehensive sample data across all tables"""
-    try:
-        # 1. Create Organizations
-        tech_org = Organization(name="TechCorp Solutions")
-        db.session.add(tech_org)
-        db.session.commit()
-
-        # 2. Create Departments
-        engineering_dept = Department(name="Engineering", org_id=tech_org.id)
-        hr_dept = Department(name="Human Resources", org_id=tech_org.id)
-        qa_dept = Department(name="Quality Assurance", org_id=tech_org.id)
-        finance_dept = Department(name="Finance", org_id=tech_org.id)
-
-        db.session.add_all([engineering_dept, hr_dept, qa_dept, finance_dept])
-        db.session.commit()
-
-        # 3. Create Teams
-        dev_team = Team(name="Development Team", dept_id=engineering_dept.id)
-        frontend_team = Team(name="Frontend Team", dept_id=engineering_dept.id)
-        backend_team = Team(name="Backend Team", dept_id=engineering_dept.id)
-        hr_team = Team(name="HR Team", dept_id=hr_dept.id)
-        qa_team = Team(name="QA Team", dept_id=qa_dept.id)
-        finance_team = Team(name="Finance Team", dept_id=finance_dept.id)
-
-        db.session.add_all(
-            [dev_team, frontend_team, backend_team, hr_team, qa_team, finance_team])
-        db.session.commit()
-
-        # 4. Create Leave Types
-        leave_types = [
-            LeaveType(
-                name="Annual Leave",
-                code="AL",
-                default_allocation=25,
-                max_carryover=5,
-                requires_approval=True,
-                can_be_negative=False,
-                description="Annual vacation leave"
-            ),
-            LeaveType(
-                name="Sick Leave",
-                code="SL",
-                default_allocation=10,
-                max_carryover=2,
-                requires_approval=True,
-                can_be_negative=True,
-                description="Medical and health-related leave"
-            ),
-            LeaveType(
-                name="Personal Leave",
-                code="PL",
-                default_allocation=5,
-                max_carryover=0,
-                requires_approval=True,
-                can_be_negative=False,
-                description="Personal matters and emergencies"
-            ),
-            LeaveType(
-                name="Maternity Leave",
-                code="ML",
-                default_allocation=90,
-                max_carryover=0,
-                requires_approval=True,
-                can_be_negative=False,
-                description="Maternity and parental leave"
-            ),
-            LeaveType(
-                name="Compassionate Leave",
-                code="CL",
-                default_allocation=3,
-                max_carryover=0,
-                requires_approval=True,
-                can_be_negative=False,
-                description="Bereavement and family emergency leave"
-            )
-        ]
-
-        db.session.add_all(leave_types)
-        db.session.commit()
-
-        # 5. Create Users
-        users = [
-            User(username='admin', password=generate_password_hash('admin123'),
-                 role='admin', team_id=dev_team.id, hire_date=date(2020, 1, 15)),
-            User(username='employee', password=generate_password_hash('employee123'),
-                 role='user', team_id=dev_team.id, hire_date=date(2021, 3, 10)),
-            User(username='john', password=generate_password_hash('john123'),
-                 role='user', team_id=frontend_team.id, hire_date=date(2022, 5, 20)),
-            User(username='jane', password=generate_password_hash('jane123'),
-                 role='user', team_id=qa_team.id, hire_date=date(2021, 8, 5)),
-            User(username='hr_manager', password=generate_password_hash('hr123'),
-                 role='admin', team_id=hr_team.id, hire_date=date(2019, 11, 1)),
-            User(username='mike', password=generate_password_hash('mike123'),
-                 role='user', team_id=backend_team.id, hire_date=date(2023, 2, 14)),
-            User(username='sarah', password=generate_password_hash('sarah123'),
-                 role='user', team_id=finance_team.id, hire_date=date(2022, 7, 8)),
-            User(username='david', password=generate_password_hash('david123'),
-                 role='manager', team_id=dev_team.id, hire_date=date(2020, 9, 12))
-        ]
-
-        db.session.add_all(users)
-        db.session.commit()
-
-        # 6. Initialize Leave Balances for all users
-        current_year = datetime.now().year
-
-        for user in users:
-            for leave_type in leave_types:
-                # Create balance for current year
-                balance = LeaveBalance(
-                    user_id=user.id,
-                    leave_type_id=leave_type.id,
-                    year=current_year,
-                    allocated_days=leave_type.default_allocation,
-                    used_days=0,
-                    pending_days=0,
-                    carried_over=0
-                )
-                db.session.add(balance)
-
-                # Create some carried over balance from previous year for demonstration
-                if leave_type.max_carryover > 0:
-                    # Simulate some carryover
-                    balance.carried_over = min(3, leave_type.max_carryover)
-
-        db.session.commit()
-
-        # 7. Create Sample Leave Applications
-        sample_leaves = [
-            Leave(
-                user_id=2,  # employee
-                leave_type_id=1,  # Annual Leave
-                start_date=date(2024, 5, 1),
-                end_date=date(2024, 5, 2),
-                reason="Family vacation",
-                status="Approved",
-                decision_reason="Standard vacation approval",
-                approved_by=1,  # admin
-                approved_at=datetime(2024, 4, 25)
-            ),
-            Leave(
-                user_id=2,  # employee
-                leave_type_id=2,  # Sick Leave
-                start_date=date(2024, 4, 15),
-                end_date=date(2024, 4, 17),
-                reason="Flu symptoms",
-                status="Approved",
-                decision_reason="Medical leave approved",
-                approved_by=5,  # hr_manager
-                approved_at=datetime(2024, 4, 14)
-            ),
-            Leave(
-                user_id=3,  # john
-                leave_type_id=1,  # Annual Leave
-                start_date=date(2024, 6, 10),
-                end_date=date(2024, 6, 15),
-                reason="Wedding ceremony",
-                status="Pending",
-                decision_reason=None
-            ),
-            Leave(
-                user_id=4,  # jane
-                leave_type_id=3,  # Personal Leave
-                start_date=date(2024, 5, 5),
-                end_date=date(2024, 5, 6),
-                reason="Personal emergency",
-                status="Approved",
-                decision_reason="Emergency situation approved",
-                approved_by=5,  # hr_manager
-                approved_at=datetime(2024, 5, 4)
-            ),
-            Leave(
-                user_id=6,  # mike
-                leave_type_id=2,  # Sick Leave
-                start_date=date(2024, 5, 20),
-                end_date=date(2024, 5, 22),
-                reason="Medical procedure",
-                status="Escalate",
-                decision_reason="Extended medical leave requires review"
-            ),
-            Leave(
-                user_id=7,  # sarah
-                leave_type_id=1,  # Annual Leave
-                start_date=date(2024, 7, 1),
-                end_date=date(2024, 7, 10),
-                reason="Summer vacation",
-                status="Pending",
-                decision_reason=None
-            )
-        ]
-
-        db.session.add_all(sample_leaves)
-        db.session.commit()
-
-        # 8. Update leave balances based on approved leaves
-        for leave in sample_leaves:
-            if leave.status == 'Approved':
-                leave.update_leave_balance()
-            elif leave.status == 'Pending':
-                leave.update_leave_balance()
-
-        # 9. Create some Leave Transactions for audit trail
-        sample_transactions = [
-            LeaveTransaction(
-                user_id=2,
-                leave_type_id=1,
-                leave_id=1,
-                transaction_type='usage',
-                days_changed=-2,
-                balance_before=25,
-                balance_after=23,
-                description='Annual leave taken - Family vacation',
-                created_by=1
-            ),
-            LeaveTransaction(
-                user_id=2,
-                leave_type_id=2,
-                leave_id=2,
-                transaction_type='usage',
-                days_changed=-3,
-                balance_before=10,
-                balance_after=7,
-                description='Sick leave taken - Flu symptoms',
-                created_by=5
-            ),
-            LeaveTransaction(
-                user_id=4,
-                leave_type_id=3,
-                leave_id=4,
-                transaction_type='usage',
-                days_changed=-2,
-                balance_before=5,
-                balance_after=3,
-                description='Personal leave taken - Emergency',
-                created_by=5
-            )
-        ]
-
-        db.session.add_all(sample_transactions)
-        db.session.commit()
-
-        logger.info(
-            "✅ Complete sample data created successfully across all tables")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error creating sample data: {e}")
-        db.session.rollback()
-        return False
-
-
-# Updated reset_database function
 @app.route('/dev/reset-db')
 def reset_database():
     if not app.debug:
@@ -3744,11 +2313,41 @@ def reset_database():
             db.drop_all()
             db.create_all()
 
-            if create_sample_data():
-                return "Database reset successfully with comprehensive sample data"
-            else:
-                return "Database reset failed during sample data creation", 500
+            dev_team = Team(name="Development Team")
+            hr_team = Team(name="HR Team")
+            qa_team = Team(name="QA Team")
+            db.session.add_all([dev_team, hr_team, qa_team])
+            db.session.commit()
 
+            users = [
+                User(username='admin', password=generate_password_hash(
+                    'admin123'), role='admin', team_id=dev_team.id),
+                User(username='employee', password=generate_password_hash(
+                    'employee123'), role='user', team_id=dev_team.id),
+                User(username='john', password=generate_password_hash(
+                    'john123'), role='user', team_id=dev_team.id),
+                User(username='jane', password=generate_password_hash(
+                    'jane123'), role='user', team_id=qa_team.id),
+                User(username='hr_manager', password=generate_password_hash(
+                    'hr123'), role='admin', team_id=hr_team.id),
+            ]
+            db.session.add_all(users)
+            db.session.commit()
+
+            sample_leaves = [
+                Leave(user_id=2, start_date=datetime(2024, 5, 1).date(), end_date=datetime(2024, 5, 2).date(),
+                      reason="Sick leave - flu", status="Approved", decision_reason="Standard sick leave approval"),
+                Leave(user_id=2, start_date=datetime(2024, 4, 15).date(), end_date=datetime(2024, 4, 17).date(),
+                      reason="Vacation with family", status="Approved", decision_reason="AI Decision: Low business impact"),
+                Leave(user_id=3, start_date=datetime(2024, 5, 10).date(), end_date=datetime(2024, 5, 15).date(),
+                      reason="Medical procedure", status="Escalate", decision_reason="AI Escalation: Extended medical leave"),
+                Leave(user_id=4, start_date=datetime(2024, 5, 5).date(), end_date=datetime(2024, 5, 6).date(),
+                      reason="Personal emergency", status="Approved", decision_reason="AI Decision: Emergency situation"),
+            ]
+            db.session.add_all(sample_leaves)
+            db.session.commit()
+
+        return "Database reset successfully with sample data"
     except Exception as e:
         logger.error(f"Database reset failed: {e}")
         return f"Database reset failed: {str(e)}", 500
@@ -3764,7 +2363,6 @@ def initialize_app():
         raise
 
 
-# Updated initialization in the main section
 if __name__ == '__main__':
     log_dir = os.path.dirname(os.path.abspath('app.log'))
     if not os.path.exists(log_dir):
@@ -3781,46 +2379,52 @@ if __name__ == '__main__':
         try:
             if not User.query.first():
                 logger.info(
-                    "📊 No existing data found, creating comprehensive sample data...")
+                    "📊 No existing data found, creating sample data...")
 
-                if create_sample_data():
-                    logger.info("✅ Complete sample data created successfully")
-                    print("\n" + "="*70)
-                    print("🎉 LEAVE MANAGEMENT SYSTEM - COMPREHENSIVE DATA INITIALIZED")
-                    print("="*70)
-                    print("📋 Sample Login Credentials:")
-                    print("   Admin: admin/admin123")
-                    print("   Employee: employee/employee123")
-                    print("   Manager: david/david123")
-                    print("   HR Manager: hr_manager/hr123")
-                    print("   QA User: jane/jane123")
-                    print("   Backend Dev: mike/mike123")
-                    print("   Finance: sarah/sarah123")
-                    print("="*70)
-                    print("🏢 Organizations & Structure:")
-                    print("   • TechCorp Solutions")
-                    print("     - Engineering (Dev, Frontend, Backend teams)")
-                    print("     - Human Resources (HR team)")
-                    print("     - Quality Assurance (QA team)")
-                    print("     - Finance (Finance team)")
-                    print("="*70)
-                    print("📅 Leave Types Available:")
-                    print("   • Annual Leave (25 days, 5 carryover)")
-                    print("   • Sick Leave (10 days, 2 carryover)")
-                    print("   • Personal Leave (5 days, no carryover)")
-                    print("   • Maternity Leave (90 days)")
-                    print("   • Compassionate Leave (3 days)")
-                    print("="*70)
-                    print("🤖 AI Features Available:")
-                    print("   • Intelligent leave decision making")
-                    print("   • Automatic escalation detection")
-                    print("   • Business impact analysis")
-                    print("   • Team availability assessment")
-                    print("   • Historical pattern analysis")
-                    print("="*70)
-                else:
-                    logger.error("❌ Failed to create sample data")
-                    print("❌ Failed to create sample data")
+                dev_team = Team(name="Development Team")
+                hr_team = Team(name="HR Team")
+                qa_team = Team(name="QA Team")
+                db.session.add_all([dev_team, hr_team, qa_team])
+                db.session.commit()
+
+                users = [
+                    User(username='admin', password=generate_password_hash('admin123'),
+                         role='admin', team_id=dev_team.id),
+                    User(username='employee', password=generate_password_hash('employee123'),
+                         role='user', team_id=dev_team.id),
+                    User(username='john', password=generate_password_hash('john123'),
+                         role='user', team_id=dev_team.id),
+                    User(username='jane', password=generate_password_hash('jane123'),
+                         role='user', team_id=qa_team.id),
+                    User(username='hr_manager', password=generate_password_hash('hr123'),
+                         role='admin', team_id=hr_team.id),
+                ]
+                db.session.add_all(users)
+                db.session.commit()
+
+                logger.info("✅ Sample data created successfully")
+                print("\n" + "="*60)
+                print("🎉 LEAVE MANAGEMENT SYSTEM - AGENTS SDK VERSION")
+                print("="*60)
+                print("📋 Sample Login Credentials:")
+                print("   Admin: admin/admin123")
+                print("   Employee: employee/employee123")
+                print("   HR Manager: hr_manager/hr123")
+                print("="*60)
+                print("🤖 AI Features Available:")
+                print("   • Intelligent leave decision making")
+                print("   • Automatic escalation detection")
+                print("   • Business impact analysis")
+                print("   • Team availability assessment")
+                print("   • Historical pattern analysis")
+                print("="*60)
+                print("🔲 Test Endpoints:")
+                print("   • /test-agents-sdk - Test AI scenarios")
+                print("   • /test-escalation - Test escalation logic")
+                print("   • /agent-analytics - View AI analytics")
+                print("   • /ai-performance - AI performance metrics")
+                print("   • /health - System health check")
+                print("="*60)
             else:
                 logger.info(
                     "📊 Existing data found, skipping sample data creation")
@@ -3828,6 +2432,7 @@ if __name__ == '__main__':
         except Exception as e:
             logger.error(f"Database initialization error: {e}")
             print(f"❌ Database initialization failed: {e}")
+
     app.config['TEMPLATES_AUTO_RELOAD'] = True
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
