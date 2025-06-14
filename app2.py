@@ -2484,9 +2484,11 @@ class AgenticLeaveSystemSDK:
         Complete workflow: Get AI decision, save Leave record, then process the decision
         """
         try:
-            # Step 1: Get AI decision (without processing)
+            # Step 1: Get AI decision (without processing) - this calls make_intelligent_decision
             ai_decision = self.make_intelligent_decision(
                 leave_request, team_members, additional_context)
+
+            logger.info(f"🤖 AI Decision received: {ai_decision}")
 
             # Step 2: Create and save the Leave record
             with app.app_context():
@@ -2496,13 +2498,32 @@ class AgenticLeaveSystemSDK:
                     leave_type_id = self.detect_leave_type(
                         leave_request.reason)
 
-                # Create Leave record
+                # Ensure we have proper date objects
+                if isinstance(leave_request.start_date, str):
+                    start_date = datetime.strptime(
+                        leave_request.start_date, '%Y-%m-%d').date()
+                else:
+                    start_date = leave_request.start_date
+
+                if isinstance(leave_request.end_date, str):
+                    end_date = datetime.strptime(
+                        leave_request.end_date, '%Y-%m-%d').date()
+                else:
+                    end_date = leave_request.end_date
+
+                # Calculate duration if not provided (for validation purposes)
+                duration_days = getattr(leave_request, 'duration_days', None)
+                if not duration_days:
+                    duration_days = (end_date - start_date).days + 1
+
+                logger.info(f"📅 Leave duration will be: {duration_days} days")
+
+                # Create Leave record (don't set duration_days - it's calculated automatically)
                 leave_record = Leave(
                     user_id=leave_request.user_id,
                     leave_type_id=leave_type_id,
-                    start_date=leave_request.start_date,
-                    end_date=leave_request.end_date,
-                    duration_days=leave_request.duration_days,
+                    start_date=start_date,
+                    end_date=end_date,
                     reason=leave_request.reason,
                     status='Pending',  # Always start as Pending
                     created_at=datetime.utcnow()
@@ -2512,7 +2533,6 @@ class AgenticLeaveSystemSDK:
                 db.session.add(leave_record)
                 db.session.commit()
                 db.session.refresh(leave_record)
-
                 logger.info(
                     f"✅ Leave saved to database with ID: {leave_record.id}")
 
@@ -2524,14 +2544,22 @@ class AgenticLeaveSystemSDK:
                     leave_record, ai_decision)
 
                 # Step 4: Combine results
-                final_result = {**ai_decision, **processing_result}
+                final_result = {
+                    **ai_decision,  # Include original AI decision
+                    **processing_result,  # Include processing results
+                    'leave_id': leave_record.id,  # Ensure leave_id is included
+                }
+
+                logger.info(f"🎯 Final result: {final_result}")
                 return final_result
 
         except Exception as e:
+            db.session.rollback()
             logger.exception(
                 f"Error in complete leave request processing: {str(e)}")
             return {
                 'status': 'Escalate',
+                'new_status': 'Pending',  # Add this for consistency
                 'reason': f'System error during complete processing: {str(e)}',
                 'confidence': 0.0,
                 'escalate': True,
@@ -2896,17 +2924,25 @@ def apply_leave():
                 logger.info(
                     f"Team context: {team.name} ({team.id}) with {len(team.members)} members")
 
-                # Create leave request object
+                # Parse dates properly
+                start_date = datetime.strptime(
+                    request.form['start_date'], '%Y-%m-%d').date()
+                end_date = datetime.strptime(
+                    request.form['end_date'], '%Y-%m-%d').date()
+                duration_days = (end_date - start_date).days + 1
+
+                # Create leave request object (don't save to DB yet)
                 leave_request = LeaveRequest(
                     reason=request.form['reason'],
-                    start_date=request.form['start_date'],
-                    end_date=request.form['end_date'],
+                    start_date=start_date,
+                    end_date=end_date,
+                    duration_days=duration_days,
                     user_id=current_user.id
                 )
 
-                # Process with Agents SDK
+                # Use the complete workflow method
                 agent_system = AgenticLeaveSystemSDK()
-                decision = agent_system.make_intelligent_decision(
+                result = agent_system.process_leave_request_complete(
                     leave_request,
                     team.members,
                     {
@@ -2916,45 +2952,42 @@ def apply_leave():
                     }
                 )
 
-                logger.info(f"🤖 Agents SDK Decision: {decision}")
+                logger.info(f"🤖 Complete processing result: {result}")
 
-                # Save to database
-                new_leave = Leave(
-                    user_id=current_user.id,
-                    start_date=datetime.strptime(
-                        request.form['start_date'], '%Y-%m-%d').date(),
-                    end_date=datetime.strptime(
-                        request.form['end_date'], '%Y-%m-%d').date(),
-                    reason=request.form['reason'],
-                    status=decision['status'],
-                    decision_reason=decision.get(
-                        'reason', 'No reason provided')
-                )
-
-                db.session.add(new_leave)
-                db.session.commit()
-                logger.info("✅ Leave saved to database")
+                if result.get('error'):
+                    flash(
+                        f'Error processing leave request: {result["error"]}', 'error')
+                    return redirect(url_for('apply_leave'))
 
                 # Enhanced flash messages with Agents SDK insights
-                confidence_text = f" (AI Confidence: {decision.get('confidence', 0):.0%})"
+                confidence_text = f" (AI Confidence: {result.get('confidence', 0):.0%})"
+                flash_message = f"🤖 Leave {result['new_status']}! {result.get('reason', '')}{confidence_text}"
 
-                flash_message = f"🤖 Leave {decision['status']}! {decision.get('reason', '')}{confidence_text}"
+                # Add balance information
+                if result.get('balance_after'):
+                    balance_info = result['balance_after']
+                    balance_text = f" | Remaining balance: {balance_info.get('remaining', 'N/A')} days"
+                    flash_message += balance_text
 
                 # Add business impact info if available
-                if decision.get('business_impact') and decision['business_impact'] != 'unknown':
-                    flash_message += f" | Business Impact: {decision['business_impact']}"
+                if result.get('business_impact') and result['business_impact'] != 'unknown':
+                    flash_message += f" | Business Impact: {result['business_impact']}"
 
-                # Add employee considerations
-                if decision.get('employee_considerations') and decision['employee_considerations'] != 'system_error':
-                    flash_message += f" | Employee factors considered: {decision['employee_considerations']}"
-
-                flash_type = 'success' if decision['status'] == 'Approved' else 'warning' if decision['status'] == 'Escalate' else 'info'
+                flash_type = 'success' if result['new_status'] == 'Approved' else 'warning' if result[
+                    'new_status'] == 'Pending' else 'info'
                 flash(flash_message, flash_type)
 
                 # Show reasoning in a separate message for transparency
-                if decision.get('agent_reasoning'):
-                    reasoning_msg = f"🧠 AI Reasoning: {decision['agent_reasoning'][:200]}..."
+                if result.get('agent_reasoning'):
+                    reasoning_msg = f"🧠 AI Reasoning: {result['agent_reasoning'][:200]}..."
                     flash(reasoning_msg, 'info')
+
+                # Show balance change details
+                if result.get('balance_before') and result.get('balance_after'):
+                    before = result['balance_before']
+                    after = result['balance_after']
+                    balance_change_msg = f"📊 Balance Update: Pending {before.get('pending', 0)} → {after.get('pending', 0)}, Remaining {before.get('remaining', 0)} → {after.get('remaining', 0)}"
+                    flash(balance_change_msg, 'info')
 
                 return redirect(url_for('dashboard'))
 
@@ -2962,7 +2995,6 @@ def apply_leave():
             logger.error(f"Date format error: {str(e)}")
             flash('Invalid date format. Please use the date picker.', 'error')
         except Exception as e:
-            db.session.rollback()
             logger.exception(f"Error processing leave request: {str(e)}")
             flash(
                 f'Error processing your leave request: {str(e)}. Please contact HR.', 'error')
@@ -3785,39 +3817,6 @@ if __name__ == '__main__':
 
                 if create_sample_data():
                     logger.info("✅ Complete sample data created successfully")
-                    print("\n" + "="*70)
-                    print("🎉 LEAVE MANAGEMENT SYSTEM - COMPREHENSIVE DATA INITIALIZED")
-                    print("="*70)
-                    print("📋 Sample Login Credentials:")
-                    print("   Admin: admin/admin123")
-                    print("   Employee: employee/employee123")
-                    print("   Manager: david/david123")
-                    print("   HR Manager: hr_manager/hr123")
-                    print("   QA User: jane/jane123")
-                    print("   Backend Dev: mike/mike123")
-                    print("   Finance: sarah/sarah123")
-                    print("="*70)
-                    print("🏢 Organizations & Structure:")
-                    print("   • TechCorp Solutions")
-                    print("     - Engineering (Dev, Frontend, Backend teams)")
-                    print("     - Human Resources (HR team)")
-                    print("     - Quality Assurance (QA team)")
-                    print("     - Finance (Finance team)")
-                    print("="*70)
-                    print("📅 Leave Types Available:")
-                    print("   • Annual Leave (25 days, 5 carryover)")
-                    print("   • Sick Leave (10 days, 2 carryover)")
-                    print("   • Personal Leave (5 days, no carryover)")
-                    print("   • Maternity Leave (90 days)")
-                    print("   • Compassionate Leave (3 days)")
-                    print("="*70)
-                    print("🤖 AI Features Available:")
-                    print("   • Intelligent leave decision making")
-                    print("   • Automatic escalation detection")
-                    print("   • Business impact analysis")
-                    print("   • Team availability assessment")
-                    print("   • Historical pattern analysis")
-                    print("="*70)
                 else:
                     logger.error("❌ Failed to create sample data")
                     print("❌ Failed to create sample data")

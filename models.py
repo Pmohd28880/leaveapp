@@ -107,7 +107,7 @@ class LeaveBalance(db.Model):
     @property
     def remaining_days(self):
         """Calculate remaining leave days"""
-        return self.allocated_days + self.carried_over - self.used_days - self.pending_days
+        return self.allocated_days - self.used_days - self.pending_days
 
     @property
     def total_available(self):
@@ -124,6 +124,9 @@ class LeaveBalance(db.Model):
         self.pending_days += days_pending
         self.updated_at = datetime.utcnow()
         db.session.commit()
+
+    def __repr__(self):
+        return f'<LeaveBalance User:{self.user_id} Type:{self.leave_type_id} Year:{self.year} Remaining:{self.remaining_days}>'
 
 
 class Leave(db.Model):
