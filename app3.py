@@ -1207,3 +1207,417 @@ def set_leave_id(mapper, connection, target):
         if holiday:
             raise ValidationError(
                 f'End date falls on a holiday: {holiday.name}.')
+
+
+@app.route('/apply_leave', methods=['GET', 'POST'])
+@role_required(['user'])
+def apply_leave():
+    email = session.get('email')
+    current_user = User.query.filter_by(email=email).first()
+    if not current_user:
+        flash('User not found', 'danger')
+        return redirect(url_for('login'))
+    print(
+        f"Step 1: Current User - ID: {current_user.id}, Email: {current_user.email}, Org: {current_user.primary_organization_id}, Dept: {current_user.primary_department_id}")
+
+    if not current_user.primary_department_id or not current_user.primary_organization_id:
+        flash('User must have a primary department and organization assigned to apply for leave', 'danger')
+        return redirect(url_for('dashboard'))
+
+    working_year = WorkingYearConfig.query.filter_by(
+        organization_id=current_user.primary_organization_id,
+        department_id=current_user.primary_department_id,
+        year=datetime.now().year
+    ).first() or WorkingYearConfig.query.filter_by(
+        organization_id=current_user.primary_organization_id,
+        department_id=None,
+        year=datetime.now().year
+    ).first()
+    if not working_year:
+        flash('Working year configuration not found for your organization', 'danger')
+        return redirect(url_for('dashboard'))
+    print(
+        f"Step 2: Working Year - ID: {working_year.id}, Hours/Day: {working_year.standard_work_hours_per_day}, Total Hours: {working_year.total_working_hours}")
+
+    hours_per_day = working_year.standard_work_hours_per_day
+
+    leave_balances = LeaveBalance.query.filter_by(
+        user_id=current_user.id,
+        fiscal_year=str(datetime.now().year)  # Ensure string
+    ).all()
+    print(
+        f"Step 3: Existing Leave Balances - Count: {len(leave_balances)}, Balances: {[{lb.leave_type_id: LeaveType.query.get(lb.leave_type_id).name} for lb in leave_balances]}")
+
+    today = datetime.now(timezone.utc).date()
+    service_years = Decimal(
+        (today - current_user.join_date).days) / Decimal('365.25')
+    print(f"Step 4: Today: {today}, Service Years: {service_years}")
+
+    # Initialize leave balances if they don't exist (same as before)
+    if not leave_balances:
+        leave_types = LeaveType.query.filter_by(
+            organization_id=current_user.primary_organization_id,
+            department_id=current_user.primary_department_id
+        ).all()
+        if not leave_types:
+            flash('No leave types defined for your department. Contact admin.', 'danger')
+            return redirect(url_for('dashboard'))
+        print(
+            f"Step 5: Leave Types - Count: {len(leave_types)}, Names: {[lt.name for lt in leave_types]}")
+
+        for leave_type in leave_types:
+            existing = LeaveBalance.query.filter_by(
+                user_id=current_user.id,
+                leave_type_id=leave_type.id,
+                fiscal_year=str(datetime.now().year)
+            ).first()
+            print(
+                f"Step 6: Checking Leave Type - {leave_type.name}, Existing Balance: {existing is not None}")
+
+            if not existing:
+                config = LeaveAccrualConfiguration.query.filter(
+                    LeaveAccrualConfiguration.leave_type_id == leave_type.id,
+                    LeaveAccrualConfiguration.department_id == current_user.primary_department_id,
+                    LeaveAccrualConfiguration.min_years_service <= service_years,
+                    LeaveAccrualConfiguration.max_years_service >= service_years
+                ).first()
+                print(
+                    f"Step 7: Config for {leave_type.name} - Found: {config is not None}, Config ID: {config.id if config else 'None'}")
+
+                if not config:
+                    print(
+                        f"Step 7.1: No department-specific config for {leave_type.name}, skipping")
+                    continue
+
+                annual_hours = config.annual_hours
+                accrual_rate = config.accrual_rate
+                accrued_hours = accrual_rate
+                print(
+                    f"Step 8: Creating Balance for {leave_type.name} - Annual Hours: {annual_hours}, Accrual Rate: {accrual_rate}, Accrued Hours: {accrued_hours}")
+
+                leave_balance = LeaveBalance(
+                    user_id=current_user.id,
+                    leave_type_id=leave_type.id,
+                    fiscal_year=str(datetime.now().year),
+                    department_id=current_user.primary_department_id,
+                    organization_id=current_user.primary_organization_id,
+                    total_available=accrued_hours,
+                    annual_allocation=annual_hours,
+                    carried_forward=Decimal('0.0'),
+                    accrued_balance=accrued_hours,
+                    total_used=Decimal('0.0')
+                )
+                db.session.add(leave_balance)
+
+        try:
+            db.session.commit()
+            print("Step 9.1: Leave balances committed successfully")
+        except Exception as e:
+            db.session.rollback()
+            print(
+                f"Step 9.2: Failed to commit leave balances - Error: {str(e)}")
+            flash(f'Error creating leave balances: {str(e)}', 'danger')
+            return redirect(url_for('dashboard'))
+
+        leave_balances = LeaveBalance.query.filter_by(
+            user_id=current_user.id,
+            fiscal_year=str(datetime.now().year)
+        ).all()
+        print(
+            f"Step 9.3: New Leave Balances Created - Count: {len(leave_balances)}")
+
+    leave_summary = current_user.get_total_leave_summary()
+    colleagues = User.query.filter(
+        User.primary_department_id == current_user.primary_department_id,
+        User.id != current_user.id
+    ).all()
+    print(f"Step 10: Colleagues - Count: {len(colleagues)}")
+
+    pending_leaves_count = Leave.query.filter_by(
+        user_id=current_user.id,
+        status='Pending'
+    ).count()
+    print(f"Step 11: Pending Leaves Count: {pending_leaves_count}")
+
+    form = LeaveApplicationForm(
+        colleagues=colleagues, current_user=current_user)
+    form.work_handover_to.choices = [('', 'Select Colleague')] + [
+        (str(colleague.id), f"{colleague.email}") for colleague in colleagues
+    ]
+    leave_types = LeaveType.query.filter_by(
+        organization_id=current_user.primary_organization_id,
+        department_id=current_user.primary_department_id
+    ).all()
+    form.leave_type.choices = [(lt.id, lt.name) for lt in leave_types]
+    leave_types_serializable = [
+        {'name': lt.name, 'requires_attachment': bool(lt.requires_attachment)}
+        for lt in leave_types
+    ]
+    print(f"Step 12: Serializable Leave Types - {leave_types_serializable}")
+
+    print(
+        f"Step 12.1: CSRF Token in Session - {session.get('_csrf_token', 'Not found')}")
+
+    if request.method == 'POST':
+        try:
+            token = request.form.get(
+                'csrf_token') or request.headers.get('X-CSRF-Token')
+            print("Step 12.2: CSRF token received: ", token)
+            validate_csrf(token)
+        except CSRFError as e:
+            print(f"Step 12.3: CSRF validation failed: {str(e)}")
+            if request.is_xhr or request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                return jsonify({'error': 'Invalid CSRF token'}), 400
+            else:
+                flash('Invalid CSRF token', 'danger')
+                return redirect(url_for('apply_leave'))
+
+        print(f"Step 12.4: Form data submitted: {request.form}")
+        if form.validate_on_submit():
+            print("Step 12.5: Form validated successfully")
+            if form.is_half_day.data and form.start_date.data != form.end_date.data:
+                form.is_half_day.errors.append(
+                    "Half day leave must be for a single day only.")
+                return render_template('apply_leave.html',
+                                       form=form,
+                                       leave_balances=leave_balances,
+                                       pending_leaves_count=pending_leaves_count,
+                                       leave_summary=leave_summary,
+                                       hours_per_day=hours_per_day,
+                                       leave_types=leave_types_serializable)
+
+            try:
+                leave_type_entry = LeaveType.query.filter_by(
+                    id=form.leave_type.data,
+                    organization_id=current_user.primary_organization_id,
+                    department_id=current_user.primary_department_id
+                ).first()
+                if not leave_type_entry:
+                    flash('Invalid leave type selected', 'danger')
+                    return redirect(url_for('apply_leave'))
+                print(
+                    f"Step 13: Selected Leave Type - {leave_type_entry.name}, ID: {leave_type_entry.id}")
+
+                start_date = form.start_date.data
+                end_date = form.end_date.data
+                is_half_day = form.is_half_day.data
+                print(
+                    f"Step 13.1: Start Date: {start_date}, End Date: {end_date}, Is Half Day: {is_half_day}")
+
+                # Calculate working days (same logic as before)
+                holidays = Holiday.query.filter(
+                    Holiday.organization_id == current_user.primary_organization_id,
+                    Holiday.date.between(start_date, end_date)
+                )
+                if current_user.primary_department_id:
+                    holidays = holidays.filter(
+                        Holiday.department_id == current_user.primary_department_id)
+                holidays = holidays.all()
+                holiday_dates = {h.date for h in holidays}
+                print(f"Step 13.2: Holiday dates: {holiday_dates}")
+
+                days = 0
+                current_date = start_date
+                print(
+                    f"Step 13.3: Checking dates from {start_date} to {end_date}")
+                while current_date <= end_date:
+                    weekday = current_date.weekday()
+                    is_holiday = current_date in holiday_dates
+                    is_counted = weekday < 5 and not is_holiday
+                    print(
+                        f"Date: {current_date}, Weekday: {weekday}, Is Weekend: {weekday >= 5}, Is Holiday: {is_holiday}, Counted: {is_counted}")
+                    if is_counted:
+                        days += 1
+                    current_date += timedelta(days=1)
+
+                if days == 0:
+                    flash(
+                        'Selected leave period contains only weekends or holidays. Please choose valid working days.', 'danger')
+                    return redirect(url_for('apply_leave'))
+
+                duration_hours = Decimal(str(days)) * \
+                    Decimal(str(hours_per_day))
+                if is_half_day:
+                    duration_hours = Decimal(
+                        str(hours_per_day)) / Decimal('2.0')
+                print(
+                    f"Step 14: Leave Duration - Start: {start_date}, End: {end_date}, Half Day: {is_half_day}, Working Days: {days}, Duration Hours: {duration_hours}")
+
+                # Handle attachment upload
+                attachment_url = None
+                if form.attachments.data:
+                    file = form.attachments.data
+                    filename = secure_filename(file.filename)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    unique_filename = f"{current_user.id}_{timestamp}_{filename}"
+                    upload_folder = os.path.join(app.root_path, 'Uploads')
+                    if not os.path.exists(upload_folder):
+                        os.makedirs(upload_folder)
+                    filepath = os.path.join(upload_folder, unique_filename)
+                    file.save(filepath)
+                    attachment_url = filepath
+                print(f"Step 17: Attachment - URL: {attachment_url}")
+
+                # 🤖 AGENTIC PROCESSING STARTS HERE
+                logger.info(
+                    f"🚀 New Agentic SDK leave request from user {current_user.id}")
+
+                # Create leave request object for agentic processing
+                class LeaveRequestObject:
+                    def __init__(self):
+                        self.user_id = current_user.id
+                        self.leave_type_id = leave_type_entry.id
+                        self.start_date = start_date
+                        self.end_date = end_date
+                        self.duration = float(duration_hours)
+                        self.reason = form.reason.data
+                        self.is_half_day = is_half_day
+                        self.emergency_contact = form.emergency_contact.data
+                        self.work_handover_to = form.work_handover_to.data or None
+                        self.attachment_url = attachment_url
+                        self.department_id = current_user.primary_department_id
+                        self.organization_id = current_user.primary_organization_id
+
+                leave_request = LeaveRequestObject()
+
+                # Get team members for context
+                team_members = [colleague.id for colleague in colleagues]
+
+                # Prepare additional context
+                additional_context = {
+                    'request_source': 'web_form',
+                    'user_role': getattr(current_user, 'role', 'user'),
+                    'department_name': current_user.primary_department.name if current_user.primary_department else 'Unknown',
+                    'organization_name': current_user.primary_organization.name if current_user.primary_organization else 'Unknown',
+                    'service_years': float(service_years),
+                    'working_days': days,
+                    'hours_per_day': float(hours_per_day)
+                }
+
+                # Use the agentic system
+                agent_system = AgenticLeaveSystemSDK()
+                result = agent_system.process_leave_request_complete(
+                    leave_request,
+                    team_members,
+                    additional_context
+                )
+
+                logger.info(f"🤖 Complete agentic processing result: {result}")
+
+                if result.get('error'):
+                    flash(
+                        f'Error processing leave request: {result["error"]}', 'danger')
+                    return redirect(url_for('apply_leave'))
+
+                # Enhanced flash messages with Agentic SDK insights
+                confidence_text = f" (AI Confidence: {result.get('confidence', 0):.0%})"
+                flash_message = f"🤖 Leave {result['new_status']}! {result.get('reason', '')}{confidence_text}"
+
+                # Add balance information
+                if result.get('balance_after'):
+                    balance_info = result['balance_after']
+                    balance_text = f" | Remaining balance: {balance_info.get('remaining', 'N/A')} days"
+                    flash_message += balance_text
+
+                # Add business impact info if available
+                if result.get('business_impact') and result['business_impact'] != 'unknown':
+                    flash_message += f" | Business Impact: {result['business_impact']}"
+
+                flash_type = 'success' if result['new_status'] == 'Approved' else 'warning' if result[
+                    'new_status'] == 'Pending' else 'info'
+                flash(flash_message, flash_type)
+
+                # Show reasoning in a separate message for transparency
+                if result.get('agent_reasoning'):
+                    reasoning_msg = f"🧠 AI Reasoning: {result['agent_reasoning'][:200]}..."
+                    flash(reasoning_msg, 'info')
+
+                # Show balance change details
+                if result.get('balance_before') and result.get('balance_after'):
+                    before = result['balance_before']
+                    after = result['balance_after']
+                    balance_change_msg = f"📊 Balance Update: Pending {before.get('pending', 0)} → {after.get('pending', 0)}, Remaining {before.get('remaining', 0)} → {after.get('remaining', 0)}"
+                    flash(balance_change_msg, 'info')
+
+                # Send email notification (same as before)
+                sender_email = "parvez@assiduusinc.com"
+                recipient = current_user.manager if current_user.manager else User.query.filter_by(
+                    role='admin').first()
+                if recipient:
+                    recipient_role = "manager" if current_user.manager else "admin"
+                    dept_name = current_user.primary_department.name if current_user.primary_department else "Unknown Department"
+                    handover_user = User.query.get(
+                        leave_request.work_handover_to) if leave_request.work_handover_to else None
+                    handover_email = handover_user.email if handover_user else "Not assigned"
+
+                    with open('templates/applyleaveemail.html', 'r') as file:
+                        email_template = file.read()
+
+                    html_body = render_template_string(
+                        email_template,
+                        recipient_role=recipient_role,
+                        user_email=current_user.email,
+                        dept_name=dept_name,
+                        leave_type=leave_type_entry.name,
+                        duration_hours=duration_hours,
+                        is_half_day=is_half_day,
+                        days=days,
+                        start_date=start_date,
+                        end_date=end_date,
+                        reason=form.reason.data or 'Not specified',
+                        handover_email=handover_email,
+                        app_url="http://127.0.0.1:5000/leave_list"
+                    )
+
+                    text_body = f"""
+                    New Leave Request (AI Processed: {result['new_status']})
+                    Hi {recipient_role},
+                    A user, {current_user.email}, from {dept_name} has requested a leave:
+                    - Leave Type: {leave_type_entry.name}
+                    - Duration: {duration_hours} hours ({'Half Day' if is_half_day else f'{days} Day(s)'})
+                    - From: {start_date}
+                    - To: {end_date}
+                    - Reason: {form.reason.data or 'Not specified'}
+                    - Work Handover: {handover_email}
+                    - AI Decision: {result['new_status']} (Confidence: {result.get('confidence', 0):.0%})
+                    - AI Reasoning: {result.get('reason', 'N/A')}
+                    Please review: http://127.0.0.1:5000/leave_list
+                    Regards,
+                    AI-Powered Leave Management System
+                    """
+
+                    email_result = send_email(
+                        sender_email, recipient.email, f"🤖 AI-Processed Leave Request: {result['new_status']}", html_body, text_body)
+
+                    if not email_result["success"]:
+                        flash(
+                            f'Leave processed successfully but notification failed: {email_result["error"]}', 'warning')
+
+                return redirect(url_for('leave_list'))
+
+            except Exception as e:
+                db.session.rollback()
+                print(f"Step 19: Error submitting leave - {str(e)}")
+                logger.exception(f"Error processing leave request: {str(e)}")
+                flash(
+                    f'Error processing your leave request: {str(e)}. Please contact HR.', 'danger')
+                return redirect(url_for('apply_leave'))
+        else:
+            print(
+                f"Step 12.6: Form validation failed with errors: {form.errors}")
+            flash('Please correct the errors in the form.', 'danger')
+            return render_template('apply_leave.html',
+                                   form=form,
+                                   leave_balances=leave_balances,
+                                   pending_leaves_count=pending_leaves_count,
+                                   leave_summary=leave_summary,
+                                   hours_per_day=hours_per_day,
+                                   leave_types=leave_types_serializable)
+    else:
+        return render_template('apply_leave.html',
+                               form=form,
+                               leave_balances=leave_balances,
+                               pending_leaves_count=pending_leaves_count,
+                               leave_summary=leave_summary,
+                               hours_per_day=hours_per_day,
+                               leave_types=leave_types_serializable)
